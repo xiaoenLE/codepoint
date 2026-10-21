@@ -1,0 +1,13 @@
+# 码点助手 没有任何第三方运行时依赖。
+#
+# 全部功能基于 Python 标准库实现：
+#   ctypes     —— Win32 API（键盘钩子、SendInput、输入法、注册表、托盘）
+#   tkinter    —— 图形界面（python.org 官方安装包自带；部分精简发行版会缺）
+#   json       —— 配置持久化
+#   unittest   —— 测试
+#   winreg     —— 开机自启
+#
+# 唯一的硬性要求：Python 3.9+，且**带 tkinter**。
+# 自检命令：  python main.py --selftest
+#
+# 因此本文件保持为空是刻意的；如果将来引入依赖，请写在这里。
