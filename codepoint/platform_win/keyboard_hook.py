@@ -363,15 +363,15 @@ class KeyboardHook:
         所以"流式卡在按下"的风险可以接受；反过来抹掉 Shift 的代价则大得多。
         """
         ks = self._ks
-        physical = {}
-        for vk in _MOD_VKS:
-            try:
-                physical[vk] = bool(user32.GetAsyncKeyState(vk) & 0x8000)
-            except Exception:      # noqa: BLE001
-                return              # 拿不到物理状态就保持流式跟踪的现状
-        for vk, down in physical.items():
-            if down and not (ks[vk] & _DOWN_BIT):
-                ks[vk] = _DOWN_BIT      # 只补
+        try:
+            missing = [vk for vk in _MOD_VKS if not (ks[vk] & _DOWN_BIT)
+                       and user32.GetAsyncKeyState(vk) & 0x8000]
+        except Exception:      # noqa: BLE001
+            return              # 拿不到物理状态就保持流式跟踪的现状
+        if not missing:
+            return
+        for vk in missing:
+            ks[vk] = _DOWN_BIT
         self._sync_generic_bits(ks)
         self._track_down_since(ks)
 
@@ -492,18 +492,16 @@ class KeyboardHook:
             #    全局事实，目标程序同样看得到；我们自己的注入不含修饰键，无影响）
             with self._lock:
                 self._update_state(vk, is_down)
+                # 之前吞掉了 key-down，对应的物理 key-up 也要吞掉。
+                if is_up and not is_injected and vk in self._swallowed:
+                    self._swallowed.discard(vk)
+                    return 1
 
             if is_injected:
                 # 自己注入的事件：一律放行，不参与业务
                 return user32.CallNextHookEx(None, n_code, WPARAM(w_param), LPARAM(l_param))
 
             swallow = False
-            with self._lock:
-                # 之前吞掉了 key-down，对应的 key-up 也要吞掉，否则目标程序会收到孤儿抬起
-                if is_up and vk in self._swallowed:
-                    self._swallowed.discard(vk)
-                    return 1
-
             if is_down:
                 with self._lock:
                     # ② 解析前用物理状态兜底一次（防个别事件被系统跳过）

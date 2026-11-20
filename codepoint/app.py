@@ -35,7 +35,7 @@ from .iconmaker import ensure_icon
 from .platform_win import autostart as autostart_mod
 from .platform_win import clipboard as clipboard_io
 from .platform_win import foreground, ime as ime_mod, input_simulator, last_input, privilege
-from .platform_win import focus_state
+from .platform_win import editor_context, focus_state
 from .platform_win import processes
 from .platform_win import screen
 from .platform_win.clipboard_listener import ClipboardListener
@@ -47,7 +47,8 @@ from .platform_win.single_instance import SingleInstance
 from .platform_win.tray import TrayIcon, TrayMenuItem
 from .services.clipboard_filter import ClipboardPunctuationFilter
 from .services.ai_provider import (
-    MAX_AUTO_LINES, ProbeResult, clean_code, create_completer, probe,
+    MAX_AUTO_LINES, AiConfigurationError, AiOutputIncomplete, MockCompleter,
+    ProbeResult, create_completer, probe,
 )
 from .services.selection import SelectionGrabber
 from .services.hook_health import HookHealthMonitor
@@ -124,9 +125,10 @@ class _ImeProbeAdapter:
 class _InjectorAdapter:
     """services.ports.TextInjector 的实现。"""
 
-    def __init__(self, mode_getter=None, suppress=None) -> None:
+    def __init__(self, mode_getter=None, suppress=None, message_window=None) -> None:
         self._mode = mode_getter or (lambda: INSERT_PASTE)
         self._suppress = suppress
+        self._message_window = message_window
 
     def send_text(self, text: str) -> None:
         input_simulator.send_unicode_text(text)
@@ -153,7 +155,9 @@ class _InjectorAdapter:
         if want_paste:
             ok = False
             try:
-                ok = input_simulator.paste_text(text, suppress=self._suppress)
+                from_hook = (self._message_window is not None
+                             and self._message_window.thread_id == threading.get_ident())
+                ok = input_simulator.paste_text(text, suppress=self._suppress, from_hook=from_hook)
             except Exception:      # noqa: BLE001
                 log.exception("粘贴插入时异常，退回逐字符写入")
                 ok = False
@@ -174,6 +178,9 @@ class _ClipboardAdapter:
 
     def get_text(self):
         return clipboard_io.get_text()
+
+    def get_selected_text(self) -> Optional[str]:
+        return clipboard_io.get_text(selection_only=True)
 
     def set_text(self, text: str) -> bool:
         return clipboard_io.set_text(text)
@@ -196,19 +203,23 @@ class _CopierAdapter:
     def wait_ready(self) -> bool:
         # 热键在"按下"那一刻触发，这时 Ctrl/Alt 还按着；
         # 不等它松开就发 Ctrl+C，会变成 Ctrl+Alt+C（谁都认不出来）。
-        return input_simulator.wait_modifiers_released()
+        return input_simulator.wait_modifiers_released(heal=False)
 
     def copy_selection(self) -> None:
         input_simulator.copy_selection()
 
-    def select_lines_up(self, count: int) -> None:
-        input_simulator.select_lines_up(count)
+    def select_context(self, count: int, *, below: bool) -> bool:
+        return input_simulator.select_context(count, below=below)
 
-    def select_lines_down(self, count: int) -> None:
-        input_simulator.select_lines_down(count)
+    def move_context_endpoint(self, count: int, *, left: bool) -> bool:
+        return input_simulator.move_context_endpoint(count, left=left)
 
-    def cancel_selection(self, to_start: bool = False) -> None:
-        input_simulator.cancel_selection(to_start=to_start)
+    def collapse_selection(self, *, to_start: bool) -> bool:
+        return input_simulator.collapse_selection(to_start=to_start)
+
+    def caret_position(self) -> Optional[tuple[int, int]]:
+        point = ime_mod.caret_point(fallback_to_cursor=False)
+        return (point.x, point.y) if point.valid else None
 
 
 def _caret_positioner():
@@ -308,7 +319,8 @@ class App:
             log.warning(self.load_error)
 
         self.paths.ensure()
-        self.icon_path = ensure_icon(self.paths.base_dir, tag=__version__)
+        icon = Path(__file__).resolve().parents[1] / "build" / "icon.ico"
+        self.icon_path = str(icon) if icon.is_file() else ensure_icon(self.paths.base_dir, tag=__version__)
 
         self._setup_services()
         if not self._setup_message_thread():
@@ -442,6 +454,7 @@ class App:
         injector = _InjectorAdapter(
             mode_getter=lambda: str(getattr(self.settings, "ai_insert_mode", "paste")),
             suppress=self._suppress_clipboard_listener,
+            message_window=self._message_window,
         )
         self._injector = injector
         # 同一个判定器同时给「逐键替换」和「AI 补全」用 —— 两边必须是同一个范围，
@@ -706,7 +719,7 @@ class App:
                 log.debug("流式刷新预览失败", exc_info=True)
         return on_delta
 
-    def _suppress_clipboard_listener(self) -> None:
+    def _suppress_clipboard_listener(self, sequence: int) -> None:
         """我们自己在改剪贴板 —— 让"标点净化"别再改一遍。
 
         粘贴插入会先把生成的代码塞进剪贴板。如果这时候净化器看到剪贴板变了，
@@ -716,14 +729,14 @@ class App:
         listener = self._clipboard_listener
         if listener is not None:
             try:
-                listener.suppress_next()
+                listener.suppress(sequence)
             except Exception:      # noqa: BLE001
                 pass
 
     def _injection_block_reason(self, hwnd: int) -> str:
         """能不能往目标窗口注入按键？空串 = 可以，否则是拒绝原因。
 
-        AI 补全要往目标窗口注入 Ctrl+C / Shift+方向键 / 文本 —— 这跟"处理自己的
+        AI 补全可能往目标窗口发送 Ctrl+C 或写入文本 —— 这跟"处理自己的
         界面"完全是两件事，是在**操作别人的程序**。所以动手前逐条问：
 
         1. 前台还是触发热键时那个窗口吗？（用户可能已经切走了）
@@ -757,14 +770,7 @@ class App:
         return not self._injection_block_reason(hwnd)
 
     def _ai_selection_worker(self, hwnd: int) -> None:
-        """Ctrl+Alt+G 的干活线程。两种模式，自动判断：
-
-        · **有选区** → 改写：把选中的内容当提示词，重写这一段；
-        · **没选区** → 补全：抓光标前 N 行当上下文，预测接下来的几行。
-
-        判断方式就是"先按一次 Ctrl+C 看剪贴板序号变没变"——变了说明有选区，
-        没变（超时）说明光标就是个点，这时才去 Shift+Up 抓上下文。
-        """
+        """优先读取编辑器文本范围，必要时用键盘取上下文。"""
         # 每次开工先把上次的取消标记清掉，否则上一次按过 Esc 会让这一次
         # 刚发出请求就被判定为"已取消"。
         self._ai_cancel.clear()
@@ -791,86 +797,84 @@ class App:
                         "把光标放回代码里（先关掉菜单）再按一次热键。" % blocked)
                 return
             completer = create_completer(self.settings)
+            demo = isinstance(completer, MockCompleter)
 
-            # ① 先试"有选区"这条路
-            grabbed = grabber.grab()
-            if grabbed.modifiers_stuck:
-                self._notify_safe(
-                    "按键还没松开",
-                    f"按完 {self.settings.ai_hotkey} 把键都松开，再试一次。",
-                )
+            lines = self.settings.ai_context_lines
+            use_fim = self.settings.ai_fim_enabled and hasattr(completer, "complete_fim")
+            target_focus = focus_state.query()
+            if target_focus.hwnd != hwnd:
                 return
+            context = editor_context.read(
+                target_focus,
+                before=lines, after=self.settings.ai_suffix_lines if lines and use_fim else 0,
+                prefix_chars=self.settings.ai_prefix_max_chars,
+                suffix_chars=self.settings.ai_suffix_max_chars,
+            )
 
-            if grabbed.ok:
-                label = "AI 改写"
-                log.info("AI 改写：选中 %d 字", len(grabbed.text))
-                on_delta = self._stream_updater(label)
-                text = clean_code(completer.complete(grabbed.text, on_delta=on_delta))
-            else:
-                # ② 没选区 → 抓上下文做预测
-                lines = max(0, int(self.settings.ai_context_lines))
-                if lines <= 0:
-                    self._notify_safe(
-                        "没有拿到内容",
-                        "先选中一段文字，或者到设置里把「上下文行数」调大。",
-                    )
-                    return
-                # FIM：先把「光标后面几行」抓下来当 suffix。
-                # 放在抓上文之前 —— 两次抓取都会把光标还原到原位，但万一这一次
-                # 失败（比如光标已经在文件末尾），上文流程还没开始，用户至少还能
-                # 拿到普通补全，而不是整条路都断掉。
-                fim_on = bool(getattr(self.settings, "ai_fim_enabled", False))
-                use_fim = fim_on and hasattr(completer, "complete_fim")
-                # 抓下文/上文都要注入 Shift+方向键。中途切走了就别抓 ——
-                # 注入的按键会落到别的程序上，那是实打实的误操作。
-                if not self._scope_allows(hwnd):
-                    self._hide_card_safe()
-                    self._notify_safe("已取消", "抓上下文的过程中前台窗口变了，已停止。")
-                    return
-                suffix = self._grab_suffix(grabber) if use_fim else ""
+            def target_still_current() -> bool:
+                return (not self._ai_cancel.is_set()
+                        and focus_state.query() == target_focus and self._scope_allows(hwnd))
 
-                if not self._scope_allows(hwnd):
-                    self._hide_card_safe()
-                    self._notify_safe("已取消", "抓上下文的过程中前台窗口变了，已停止。")
+            if not target_still_current():
+                return
+            if context is None:
+                process_name = foreground.query(hwnd).process_name
+                is_st_editor = process_name in {"codesys.exe", "invtmatic studio.exe"}
+                grabbed = grabber.grab(can_copy=target_still_current)
+                if grabbed.modifiers_stuck:
+                    self._notify_safe("按键还没松开", f"按完 {self.settings.ai_hotkey} 把键都松开，再试一次。")
                     return
-                ctx = grabber.grab_lines(lines)
-                # 抓取过程注入过 Shift/Ctrl。万一某次 key-up 被系统拒了
-                # （SendInput 返回 0 但不抛异常），修饰键会卡在"按下"状态 ——
-                # 而钩子只自愈 Ctrl/Alt/Win，Shift 卡住会让**之后每次**触发
-                # 都被判成"按键没松开"，功能直接不可用。这里主动清一遍，
-                # 成本几毫秒，换的是"打断之后还能接着用"。
-                input_simulator.release_modifiers()
-                if ctx.modifiers_stuck:
-                    self._notify_safe("按键还没松开", "按完热键把键都松开再试。")
+                if not target_still_current():
                     return
-                if not ctx.ok:
-                    self._notify_safe(
-                        "没有拿到上下文",
-                        f"已经试着抓光标前 {lines} 行，但剪贴板没变化。"
-                        "把光标放到一行代码下面（不要在文件第一行）再试。",
-                    )
+                if grabbed.ok:
+                    context = editor_context.EditorContext(selection=grabbed.text)
+                elif grabbed.text and not is_st_editor:
+                    self._notify_safe("选区没有代码", "请清除空白选区，或选中相关代码后再试。")
                     return
-                label = "AI 补全"
-                # 目标行数跟着「预览窗能显示几行」走，但不低于 8。
-                # 以前这里固定 min(8, ...) 砍一刀，表现是"卡片能放 14 行、模型只补 8 行"。
-                # 现在显示几行就要几行，卡片放得下、不会一打开就折叠。
-                # 想让它写更多：把「补全预览窗 → 行数」调大（或调 ai_max_tokens）。
-                max_lines = max(8, int(self.settings.ai_card_max_lines))
-                log.info("AI 补全：上文 %d 字 · 下文 %d 字 · 最多 %d 行",
-                         len(ctx.text), len(suffix), max_lines)
-                on_delta = self._stream_updater(label)
-                if use_fim:
-                    text = self._fim_or_fallback(
-                        completer, ctx.text, suffix, max_lines, on_delta)
+                elif lines <= 0:
+                    self._notify_safe("请先选中代码", "上下文行数设为 0 时只处理选区。")
+                    return
                 else:
-                    text = clean_code(completer.complete_lines(
-                        ctx.text, max_lines, on_delta=on_delta))
+                    # ST 编辑器在空行上也可能复制出换行，按旧版行为继续取上下文。
+                    capture_options = {
+                        "can_copy": target_still_current,
+                        "collapse_to_anchor": is_st_editor,
+                    }
+                    prefix = grabber.grab_context(lines, below=False, **capture_options)
+                    if not target_still_current() or self._context_grab_failed(prefix):
+                        return
+                    suffix = ""
+                    if use_fim and self.settings.ai_suffix_lines:
+                        below = grabber.grab_context(self.settings.ai_suffix_lines, below=True,
+                                                     **capture_options)
+                        if not target_still_current() or self._context_grab_failed(below):
+                            return
+                        suffix = below.text
+                    context = editor_context.EditorContext(prefix=prefix.text, suffix=suffix)
+
+            if context.selection.strip():
+                label = "本地演练 · 示例" if demo else "AI 改写"
+                log.info("AI 改写：选中 %d 字", len(context.selection))
+                on_delta = self._stream_updater(label)
+                text = completer.complete(context.selection, on_delta=on_delta)
+            else:
+                prefix, suffix = context.prefix, context.suffix
+                if not prefix.strip() and not suffix.strip():
+                    self._notify_safe("没有可用的上下文", "请先选中相关代码，或在已有代码附近触发补全。")
+                    return
+                label = "本地演练 · 示例" if demo else "AI 补全"
+                log.info("AI 补全：上文 %d 字 · 下文 %d 字", len(prefix), len(suffix))
+                on_delta = self._stream_updater(label)
+                if use_fim and (suffix.strip() or self.settings.ai_fim_strategy != "auto"):
+                    text = self._fim_or_fallback(completer, prefix, suffix, on_delta)
+                else:
+                    text = completer.complete_lines(prefix, on_delta=on_delta)
 
             if not text.strip():
                 self._hide_card_safe()
-                self._notify_safe("AI 没有返回内容", "到设置里点「测试连接」看后端通不通。")
+                self._notify_safe("没有生成可插入的代码", "可以补充相关上下文，或在选区里说明想改什么。")
                 return
-            if int(foreground.query().hwnd or 0) != hwnd:
+            if not target_still_current():
                 self._hide_card_safe()
                 self._notify_safe("已取消", "等待期间前台窗口变了，没有插入。")
                 return
@@ -888,7 +892,13 @@ class App:
                 injector.send_block(text, always_paste=True)
             else:      # pragma: no cover —— 装配正常时不会走到这里
                 input_simulator.send_unicode_text(text)
-            self._notify_safe("已插入", f"{len(text)} 字")
+            self._notify_safe("已插入演练示例" if demo else "已插入", f"{len(text)} 字")
+        except AiConfigurationError as exc:
+            self._hide_card_safe()
+            self._notify_safe("AI 配置需要检查", str(exc))
+        except AiOutputIncomplete as exc:
+            self._hide_card_safe()
+            self._notify_safe("补全未完成", str(exc))
         except _AiCancelled:
             # 用户按 Esc 主动掐掉的 —— 不弹"失败"，也别留半截卡片
             self._hide_card_safe()
@@ -904,30 +914,14 @@ class App:
             except Exception:      # noqa: BLE001
                 pass
 
-    def _grab_suffix(self, grabber) -> str:
-        """抓光标后面几行当 FIM 的 suffix。
+    def _context_grab_failed(self, result) -> bool:
+        if result.caret_uncertain:
+            self._notify_safe("已取消补全", "无法确认光标已回到原位，请检查编辑位置后重试。")
+        elif result.modifiers_stuck:
+            self._notify_safe("按键还没松开", f"按完 {self.settings.ai_hotkey} 把键都松开，再试一次。")
+        return result.caret_uncertain or result.modifiers_stuck
 
-        **抓不到就当没有**，绝不抛给上层 —— suffix 是锦上添花，缺了最多是
-        退化回"只看上文"的老行为；为它把整次补全搞挂就不值了。
-        """
-        count = int(getattr(self.settings, "ai_suffix_lines", 0) or 0)
-        if count <= 0:
-            return ""
-        try:
-            result = grabber.grab_lines_down(count)
-        except Exception:      # noqa: BLE001
-            log.warning("抓 FIM 下文失败", exc_info=True)
-            return ""
-        if result.modifiers_stuck:
-            return ""
-        if not result.ok:
-            log.info("FIM：光标后面没抓到内容（可能已经在文件末尾）")
-            return ""
-        log.info("FIM：下文 %d 字", len(result.text))
-        return result.text
-
-    def _fim_or_fallback(self, completer, prefix: str, suffix: str,
-                         max_lines: int, on_delta) -> str:
+    def _fim_or_fallback(self, completer, prefix: str, suffix: str, on_delta) -> str:
         """先走 FIM，不行就退回老 chat 补全。
 
         为什么要有兜底：FIM 依赖服务端支持 ``/completions``。碰上不支持的服务
@@ -937,10 +931,8 @@ class App:
         strategy = getattr(self.settings, "ai_fim_strategy", "auto")
         tokens = getattr(self.settings, "ai_fim_tokens", "auto")
         try:
-            # FIM 没有"最多 N 行"这种提示词约束，模型靠 token 自己停；
-            # 这里的行数只当安全阀（防一口气续几百行），所以再夹一层。
             text = completer.complete_fim(
-                prefix, suffix, min(max_lines, MAX_AUTO_LINES),
+                prefix, suffix, MAX_AUTO_LINES,
                 on_delta=on_delta, strategy=strategy, tokens=tokens)
             if text.strip():
                 return text
@@ -951,7 +943,7 @@ class App:
             raise
         except Exception as exc:      # noqa: BLE001
             log.warning("FIM 补全失败（%s），退回普通补全", exc)
-        return clean_code(completer.complete_lines(prefix, max_lines, on_delta=on_delta))
+        return completer.complete_lines(prefix, on_delta=on_delta, suffix=suffix)
 
     def cancel_pending(self) -> None:
         """预览窗倒计时到点时由界面线程调进来。"""
@@ -985,7 +977,14 @@ class App:
 
     def test_ai(self) -> None:
         """界面上那个「测试连接」按钮。**真发一次请求**，不是看配置猜。"""
-        completer = create_completer(self.settings)
+        try:
+            completer = create_completer(self.settings)
+        except AiConfigurationError as exc:
+            self._notify_safe("AI 配置需要检查", str(exc))
+            return
+        if isinstance(completer, MockCompleter):
+            self._notify_safe("当前为本地演练", "演练模式使用固定示例。选择实际服务后可测试连接。")
+            return
         self._notify_safe("正在测试 AI 连接…", "最多等 20 秒。")
 
         def worker() -> None:
@@ -1058,14 +1057,17 @@ class App:
     def _process_clipboard(self) -> None:
         if not self.settings.enable_clipboard_replace:
             return
+        sequence = clipboard_io.sequence_number()
+        listener = self._clipboard_listener
+        if listener is not None and listener.is_suppressed(sequence):
+            return
         text = clipboard_io.get_text()
         if not text or not self._clipboard_filter.should_rewrite(text):
             return
         converted, count = self._clipboard_filter.transform(text)
         if count and converted != text:
-            if self._clipboard_listener is not None:
-                self._clipboard_listener.suppress_next()
-            if clipboard_io.set_text(converted):
+            if clipboard_io.set_text(converted, expected_sequence=sequence,
+                                     on_written=self._suppress_clipboard_listener):
                 if self._pipeline:
                     self._pipeline.stats.last_reason = f"剪贴板净化 {count} 处"
                 log.info("剪贴板已净化 %d 处标点", count)

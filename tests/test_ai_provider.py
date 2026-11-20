@@ -133,6 +133,11 @@ class TestMessages(unittest.TestCase):
         msgs = ai.build_messages("x", context="A" * 9000)
         self.assertLess(len(msgs[1]["content"]), 7000)
 
+    def test_selected_code_is_treated_as_a_replacement(self):
+        msgs = ai.build_messages("    output := input;")
+        self.assertIn("返回完整的替换片段", msgs[0]["content"])
+        self.assertIn("选中的是需求时", msgs[0]["content"])
+
 
 # ---------------------------------------------------------------- 补全提示词
 
@@ -156,13 +161,17 @@ class TestCompletionMessages(unittest.TestCase):
         self.assertIn("最多 4 行", self._last_user(msgs))
 
     def test_includes_few_shot(self):
-        # few-shot 样例要插在真实用户消息之前，小模型靠模仿才学会规律
-        msgs = ai.build_completion_messages("x := 1;", 6)
+        # 数组规律示例只用于已识别的数组映射。
+        msgs = ai.build_completion_messages("a[0] := y1;\na[1] := y2;", 6)
         roles = [m["role"] for m in msgs]
         self.assertIn("assistant", roles)
         last_user = max(i for i, r in enumerate(roles) if r == "user")
         first_assistant = roles.index("assistant")
         self.assertLess(first_assistant, last_user)
+
+    def test_generic_code_has_no_st_examples(self):
+        msgs = ai.build_completion_messages("def read_file(path):\n    with open(path) as f:", 6)
+        self.assertEqual([message["role"] for message in msgs], ["system", "user"])
 
     def test_system_tells_it_not_to_repeat(self):
         self.assertIn("不要重复", ai.COMPLETION_SYSTEM)
@@ -501,6 +510,35 @@ class TestStreaming(unittest.TestCase):
         self.assertEqual(out, "IO_Map.x := 1;")
         self.assertEqual(len(got), 2)
 
+    def test_plain_number_sequences_keep_their_separator_without_request(self):
+        for prefix, expected in (
+            ("x := 123;\n4 5 6 7 8", " 9 10 11"),
+            ("4 5 6 7 8 ", "9 10 11"),
+            ("  6\r\n  7\r\n  8", "\n  9\n  10\n  11"),
+        ):
+            with self.subTest(prefix=prefix), mock.patch("urllib.request.urlopen") as opened:
+                out = self._completer().complete_lines(prefix, 3, suffix="\r\n \t")
+                opened.assert_not_called()
+                self.assertEqual(out, expected)
+
+    def test_chat_completion_uses_both_sides_and_keeps_only_the_gap(self):
+        prefix = "def run():\n    prepare()\n"
+        suffix = "\n    return result"
+        gap = "    result = work()"
+        payload = {"choices": [{"message": {"content": prefix + gap + suffix}}]}
+        with mock.patch("urllib.request.urlopen", return_value=_fake_response(payload)) as opened:
+            output = self._completer().complete_lines(prefix, suffix=suffix)
+        request = json.loads(opened.call_args.args[0].data)
+        self.assertIn(f"<prefix>{prefix}</prefix>", request["messages"][-1]["content"])
+        self.assertIn(f"<suffix>{suffix}</suffix>", request["messages"][-1]["content"])
+        self.assertEqual(output, gap)
+
+    def test_selected_code_output_keeps_its_indent(self):
+        expected = "    value = read()\n    return value"
+        payload = {"choices": [{"message": {"content": f"```python\n{expected}\n```"}}]}
+        with mock.patch("urllib.request.urlopen", return_value=_fake_response(payload)):
+            self.assertEqual(self._completer().complete("    return value"), expected)
+
 
 class TestDisableThinking(unittest.TestCase):
     """关思考：推理模型补全慢 5 倍的元凶（实测 MiMo 首字 9.7s → 1.7s）。"""
@@ -602,12 +640,20 @@ class TestFactory(unittest.TestCase):
         s.ai_model = "qwen"
         self.assertIsInstance(ai.create_completer(s), ai.OpenAiCompleter)
 
-    def test_broken_config_falls_back_to_mock(self):
-        # 地址填了一半（空）不能让 Tab 按下去毫无反应
-        s = Settings()
-        s.ai_provider = "openai"
-        s.ai_base_url = ""
-        self.assertIsInstance(ai.create_completer(s), ai.MockCompleter)
+    def test_missing_address_reports_configuration_error(self):
+        s = Settings(ai_provider="openai", ai_base_url="")
+        with self.assertRaisesRegex(ai.AiConfigurationError, "请输入 AI 服务地址"):
+            ai.create_completer(s)
+
+    def test_malformed_address_reports_configuration_error(self):
+        s = Settings(ai_provider="openai", ai_base_url="localhost:11434/v1")
+        with self.assertRaisesRegex(ai.AiConfigurationError, "http:// 或 https://"):
+            ai.create_completer(s)
+
+    def test_missing_model_reports_configuration_error(self):
+        s = Settings(ai_provider="openai", ai_model=" ")
+        with self.assertRaisesRegex(ai.AiConfigurationError, "请输入 AI 模型名"):
+            ai.create_completer(s)
 
 
 # ---------------------------------------------------------------- 挂起 / 确认

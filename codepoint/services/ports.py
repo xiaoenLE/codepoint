@@ -98,6 +98,10 @@ class ClipboardPort(Protocol):
     def get_text(self) -> Optional[str]:
         ...
 
+    def get_selected_text(self) -> Optional[str]:
+        """读复制结果。编辑器代复制的整行按空选区处理。"""
+        ...
+
     def set_text(self, text: str) -> bool:
         ...
 
@@ -120,28 +124,19 @@ class SelectionCopier(Protocol):
     def copy_selection(self) -> None:
         ...
 
-    def select_lines_up(self, count: int) -> None:
-        """Shift+Up × count —— 选中光标上方 count 行。
-
-        拿"光标前几行"当上下文用。没有 UIA 的编辑器（CODESYS）只能这么取。
-        """
+    def select_context(self, count: int, *, below: bool) -> bool:
+        """以光标为锚点向上或向下选取文字。"""
         ...
 
-    def select_lines_down(self, count: int) -> None:
-        """Shift+Down × count —— 选中光标下方 count 行。
-
-        FIM 要的"光标后面已经写了什么"就靠这个取。取法和向上选一样靠剪贴板，
-        因为 CODESYS / Invtmatic 的自绘编辑器读不到正文。
-        """
+    def move_context_endpoint(self, count: int, *, left: bool) -> bool:
+        """保持临时选区的锚点，移动活动端。"""
         ...
 
-    def cancel_selection(self, to_start: bool = False) -> None:
-        """取消选区，并把光标放回**原来那一点**。
+    def collapse_selection(self, *, to_start: bool) -> bool:
+        """用方向键折叠到选区的指定一端。"""
+        ...
 
-        ``to_start=False``（默认）发 Right：向上选出来的选区，右端就是原位；
-        ``to_start=True`` 发 Left：向下选出来的选区，左端才是原位 ——
-        这一端搞反，光标会跑到文件后面去，用户接着打字就打错地方了。
-        """
+    def caret_position(self) -> Optional[tuple[int, int]]:
         ...
 
 
@@ -154,6 +149,9 @@ class NullClipboard:
 
     def get_text(self) -> Optional[str]:        # noqa: D102
         return self.text
+
+    def get_selected_text(self) -> Optional[str]:
+        return self.get_text()
 
     def set_text(self, text: str) -> bool:      # noqa: D102
         self.text = text
@@ -173,13 +171,13 @@ class NullCopier:
     def copy_selection(self) -> None:           # noqa: D102
         return None
 
-    def select_lines_up(self, count: int) -> None:   # noqa: D102
-        return None
+    def select_context(self, count: int, *, below: bool) -> bool:
+        return False
 
-    def select_lines_down(self, count: int) -> None:  # noqa: D102
-        return None
+    def move_context_endpoint(self, count: int, *, left: bool) -> bool:
+        return False
 
-    def cancel_selection(self, to_start: bool = False) -> None:  # noqa: D102
+    def caret_position(self) -> Optional[tuple[int, int]]:
         return None
 
 

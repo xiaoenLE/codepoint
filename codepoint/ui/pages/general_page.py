@@ -14,8 +14,12 @@ from ...core.models import (
     INSERT_LABELS, INSERT_MODES, INSERT_PASTE,
     MATCH_ALL, MATCH_LABELS, MATCH_WHITELIST,
 )
+from ...services.ai_provider import PRESETS, PROVIDER_MOCK, PROVIDER_OPENAI
 from .. import theme
 from .base import Page
+
+
+_CUSTOM_AI_SERVICE = "自定义"
 
 
 class GeneralPage(Page):
@@ -260,7 +264,7 @@ class GeneralPage(Page):
         sw.pack()
 
     def _choice_row(self, title: str, desc: str, *, options: List[str],
-                    current: str, on_change: Callable[[str], None]) -> None:
+                    current: str, on_change: Callable[[str], None]) -> tk.StringVar:
         _row, right = self._row(title, desc)
         var = tk.StringVar(value=current)
 
@@ -271,6 +275,7 @@ class GeneralPage(Page):
                              state="readonly", style="TCombobox", width=22)
         combo.pack()
         combo.bind("<<ComboboxSelected>>", _changed)
+        return var
 
     def _hotkey_row(self, current: str) -> None:
         row, right = self._row("启用/暂停热键",
@@ -309,40 +314,38 @@ class GeneralPage(Page):
     # ------------------------------------------------------------ AI 补全
 
     def _ai_section(self, settings) -> None:
-        from ...services.ai_provider import (
-            FIM_FAMILY_CHOICES, FIM_STRATEGY_CHOICES, PRESETS,
-        )
+        from ...services.ai_provider import FIM_FAMILY_CHOICES, FIM_STRATEGY_CHOICES
 
         self._section(
             "AI 补全",
-            "一个热键两种用法：选中文字按热键就重写选中那段；不选就预测接下来要写的。\n"
-            "语言跟着你的代码走 —— ST、C、Python 都行，提示词不绑定任何语言。\n"
-            "默认是「本地演练」：返回写死的示例代码 —— 先用它确认整条链路通不通。")
+            "选中代码可改写选区，选中文本需求可生成代码。无选区时读取光标附近的代码。\n"
+            "「本地演练」返回固定示例。使用实际模型时请选择相应服务。")
 
         self._switch_row("启用 AI 补全",
-                         "关掉之后 //ai 不再被拦截，Tab 正常用来缩进和编辑器自己的补全。",
+                         "开启后可用下方热键启动生成。",
                          settings.ai_enabled, self._on_ai_enabled)
 
-        self._choice_row(
-            "服务",
-            "选一个会把下面两格自动填好；填得不对直接手改。",
-            options=[p.label for p in PRESETS],
+        self._ai_preset_var = self._choice_row(
+            "服务预设",
+            "本地演练只显示固定示例。请选择实际服务，或选「自定义」填写地址和模型。",
+            options=[p.label for p in PRESETS] + [_CUSTOM_AI_SERVICE],
             current=self._preset_label(settings),
             on_change=self._on_ai_preset)
 
-        self._ai_vars = {
-            "base_url": self._entry_row(
+        self._ai_fields = {
+            "ai_base_url": self._entry_row(
                 "服务地址",
                 "OpenAI 兼容端点。填到 /v1 就够 —— 程序会自己补 /chat/completions。",
-                settings.ai_base_url, self._on_ai_base_url),
-            "model": self._entry_row(
-                "模型名", "", settings.ai_model, self._on_ai_model),
-            "api_key": self._entry_row(
+                settings.ai_base_url, lambda text: self._on_ai_field("ai_base_url", text)),
+            "ai_model": self._entry_row(
+                "模型名", "", settings.ai_model, lambda text: self._on_ai_field("ai_model", text)),
+            "ai_api_key": self._entry_row(
                 "API Key",
                 "本地模型留空即可。明文存在 settings.json 里（本机自用没问题，\n"
                 "多人共用这台机器时请三思）。",
-                settings.ai_api_key, self._on_ai_key, secret=True),
+                settings.ai_api_key, lambda text: self._on_ai_field("ai_api_key", text), secret=True),
         }
+        self._update_ai_fields(settings.ai_provider)
 
         # 超时/温度/最大长度不放到界面上：调它们的人会直接改 settings.json，
         # 不调的人看到三个数字只会犹豫。这里把当前值显示出来，方便核对。
@@ -390,9 +393,8 @@ class GeneralPage(Page):
             "ai_card_timeout", settings.ai_card_timeout, 0, 300, 1, is_float=True)
         self._number_row(
             "上下文行数",
-            "没选中内容时，抓光标前这么多行去预测接下来写什么（默认 6，最多 30）。\n"
-            "抓不到就把这个调小；调 0 表示只支持「选中改写」，不做预测。\n"
-            "行数之外还有字符上限（见上面的高级参数）—— 一行太长照样会撑大上下文。",
+            "取光标前的代码（默认 6 行，最多 30）。"
+            "调 0 时仅使用选区。",
             "ai_context_lines", settings.ai_context_lines, 0, 30, 1)
 
         self._switch_row(
@@ -417,13 +419,10 @@ class GeneralPage(Page):
 
         self._section(
             "FIM 补全（顺便看光标后面）",
-            "上面那套只把光标前面的代码给模型，它看不见后面 —— 所以写到一半按热键时，\n"
-            "它经常自己另起一段、越写越偏。打开 FIM 之后，程序会顺手把光标后面几行也抓过去，\n"
-            "模型只负责把中间缺的那段填上。小模型（1~2B）上差别非常明显。\n"
-            "代价是每次多按一次键、多等半秒左右。")
+            "把光标前后的代码一起交给模型，补中间缺的片段。")
         self._switch_row(
             "启用 FIM 补全",
-            "关掉就退回老办法：只看上文猜下文。",
+            "只支持聊天接口的服务也能使用已抓取的下文。",
             settings.ai_fim_enabled, self._on_fim_enabled)
         self._choice_row(
             "请求方式",
@@ -456,41 +455,36 @@ class GeneralPage(Page):
         return choices[0][1]
 
     def _preset_label(self, settings) -> str:
-        from ...services.ai_provider import PRESETS
-
         # provider=mock 时先认它：默认 settings 里 base_url 预填的是 llama.cpp 的
         # 地址，若先按地址匹配，界面上会显示成 "llama.cpp" 而实际在跑演练模式。
-        if (settings.ai_provider or "") == "mock":
+        if settings.ai_provider == PROVIDER_MOCK:
             return PRESETS[0].label
         base = (settings.ai_base_url or "").rstrip("/")
+        model = (settings.ai_model or "").strip()
         for preset in PRESETS:
-            if preset.base_url and preset.base_url.rstrip("/") == base:
+            if preset.base_url and preset.base_url.rstrip("/") == base and preset.model == model:
                 return preset.label
-        return PRESETS[1].label
+        return _CUSTOM_AI_SERVICE
 
     def _entry_row(self, title: str, desc: str, value: str,
                    on_commit: Callable[[str], None],
-                   *, secret: bool = False) -> tk.StringVar:
+                   *, secret: bool = False) -> Tuple[tk.StringVar, tk.Entry]:
         """一行输入框。**失焦或回车才提交** —— 每敲一个字符就 save 一次太吵。"""
         _row, right = self._row(title, desc)
         var = tk.StringVar(value=value or "")
         entry = tk.Entry(right, textvariable=var, width=30,
-                         bg=theme.SUNKEN, fg=theme.TEXT, relief="flat",
+                         bg=theme.SUNKEN, readonlybackground=theme.SUNKEN,
+                         fg=theme.TEXT, relief="flat",
                          font=theme.F_SMALL, highlightthickness=0,
                          show="*" if secret else "")
         entry.pack(ipady=5)
-        state = {"last": (value or "").strip()}
-
         def _flush(_event=None) -> None:
-            text = var.get().strip()
-            if text == state["last"]:
-                return
-            state["last"] = text
-            on_commit(text)
+            if entry.cget("state") == "normal":
+                on_commit(var.get().strip())
 
         entry.bind("<FocusOut>", _flush)
         entry.bind("<Return>", _flush)
-        return var
+        return var, entry
 
     # ------------------------------------------------------------ 回调
 
@@ -535,32 +529,34 @@ class GeneralPage(Page):
         self._commit(quiet=True)
 
     def _on_ai_preset(self, label: str) -> None:
-        from ...services.ai_provider import PRESETS
-
-        for preset in PRESETS:
-            if preset.label != label:
-                continue
-            settings = self.facade.get_settings()
+        settings = self.facade.get_settings()
+        if label == _CUSTOM_AI_SERVICE:
+            settings.ai_provider = PROVIDER_OPENAI
+        else:
+            preset = next((p for p in PRESETS if p.label == label), None)
+            if preset is None:
+                return
             settings.ai_provider = preset.provider
             if preset.base_url:
                 settings.ai_base_url = preset.base_url
-                self._ai_vars["base_url"].set(preset.base_url)
+                self._ai_fields["ai_base_url"][0].set(preset.base_url)
             if preset.model:
                 settings.ai_model = preset.model
-                self._ai_vars["model"].set(preset.model)
-            self._commit(quiet=True)
+                self._ai_fields["ai_model"][0].set(preset.model)
+        self._update_ai_fields(settings.ai_provider)
+        self._commit(quiet=True)
+
+    def _update_ai_fields(self, provider: str) -> None:
+        editable = provider == PROVIDER_OPENAI
+        for _, entry in self._ai_fields.values():
+            entry.configure(state="normal" if editable else "readonly", takefocus=editable)
+
+    def _on_ai_field(self, field: str, text: str) -> None:
+        settings = self.facade.get_settings()
+        if settings.ai_provider != PROVIDER_OPENAI or getattr(settings, field) == text:
             return
-
-    def _on_ai_base_url(self, text: str) -> None:
-        self.facade.get_settings().ai_base_url = text
-        self._commit(quiet=True)
-
-    def _on_ai_model(self, text: str) -> None:
-        self.facade.get_settings().ai_model = text
-        self._commit(quiet=True)
-
-    def _on_ai_key(self, text: str) -> None:
-        self.facade.get_settings().ai_api_key = text
+        setattr(settings, field, text)
+        self._ai_preset_var.set(self._preset_label(settings))
         self._commit(quiet=True)
 
     def _on_disable_thinking(self, value: bool) -> None:

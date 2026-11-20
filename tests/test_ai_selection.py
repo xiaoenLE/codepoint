@@ -6,10 +6,11 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from codepoint.core.models import Settings
 from codepoint.services import ai_provider as ai
-from codepoint.services.selection import SelectionGrabber
+from codepoint.services.selection import GrabResult, SelectionGrabber
 
 
 # ---------------------------------------------------------------- 替身
@@ -37,6 +38,9 @@ class FakeClipboard:
     def get_text(self):
         return self.text
 
+    def get_selected_text(self):
+        return self.get_text()
+
     def set_text(self, text: str) -> bool:
         self.text = text
         self.seq += 1
@@ -59,6 +63,7 @@ class FakeCopier:
         self.calls = 0
         self.waits = 0
         self.order: list = []
+        self.remaining_after_restore = None
 
     def wait_ready(self) -> bool:
         self.waits += 1
@@ -73,15 +78,21 @@ class FakeCopier:
         if self.payload is not None:
             self.clipboard.set_text(self.payload)
 
-    def select_lines_up(self, count: int) -> None:
-        self.order.append(f"up{count}")
+    def select_context(self, count: int, *, below: bool) -> bool:
+        self.order.append(("select", count, below))
+        return True
 
-    def select_lines_down(self, count: int) -> None:
-        self.order.append(f"down{count}")
+    def move_context_endpoint(self, count: int, *, left: bool) -> bool:
+        self.order.append(("move", count, left))
+        self.payload = self.remaining_after_restore
+        return True
 
-    def cancel_selection(self, to_start: bool = False) -> None:
-        # to_start=True 是"向下选"之后用的：左端才是原来的光标位置
-        self.order.append("left" if to_start else "right")
+    def collapse_selection(self, *, to_start: bool) -> bool:
+        self.order.append(("collapse", to_start))
+        return True
+
+    def caret_position(self):
+        return None
 
 
 def _grabber(clipboard, copier, *, wait=0.05):
@@ -144,6 +155,15 @@ class TestSelectionGrabber(unittest.TestCase):
         result = _grabber(clipboard, copier).grab()
         self.assertFalse(result.ok)          # 全是空白就等于没选中
 
+    def test_editor_whole_line_copy_is_not_an_explicit_selection(self):
+        clipboard = FakeClipboard("旧")
+        copier = FakeCopier(clipboard, payload="current_line;\r\n")
+        clipboard.get_selected_text = mock.Mock(return_value="")
+        result = _grabber(clipboard, copier).grab()
+        self.assertFalse(result.ok)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(clipboard.text, "旧")
+
     def test_copies_only_once(self):
         clipboard = FakeClipboard("旧")
         copier = FakeCopier(clipboard, payload="内容")
@@ -183,57 +203,208 @@ class TestSelectionGrabber(unittest.TestCase):
         self.assertTrue(empty.timed_out)
 
 
-# ---------------------------------------------------------------- 上下文抓取
-
-
-class TestGrabLines(unittest.TestCase):
-    """抓"光标前 N 行"—— 没 UIA 的编辑器（CODESYS）唯一能取上下文的办法。"""
-
-    def test_full_sequence(self):
-        clipboard = FakeClipboard("旧剪贴板")
-        copier = FakeCopier(clipboard, payload="第1行\n第2行\n第3行\n")
-        result = _grabber(clipboard, copier).grab_lines(3)
-
-        self.assertTrue(result.ok)
-        self.assertIn("第2行", result.text)
-        # 顺序固定：先等修饰键松开，再选中、复制，最后取消选区
-        self.assertEqual(copier.order, ["wait", "up3", "copy", "right"])
-        # 用户原来的剪贴板要还回去
-        self.assertEqual(clipboard.text, "旧剪贴板")
-
-    def test_nothing_copied_still_cancels_selection(self):
-        """没抓到也必须按 Right —— 否则用户屏幕上留着一片蓝汪汪的选区。"""
-        clipboard = FakeClipboard("旧")
-        copier = FakeCopier(clipboard, payload=None)
-        result = _grabber(clipboard, copier).grab_lines(5)
-
+    def test_focus_guard_skips_copy_after_waiting(self):
+        clipboard = FakeClipboard("旧内容")
+        copier = FakeCopier(clipboard, payload="不能复制的内容")
+        result = _grabber(clipboard, copier).grab(can_copy=lambda: False)
         self.assertFalse(result.ok)
-        self.assertTrue(result.timed_out)
-        self.assertIn("right", copier.order)
+        self.assertEqual(copier.calls, 0)
+        self.assertEqual(clipboard.writes, [])
 
-    def test_copy_failure_still_cancels_selection(self):
+    def test_empty_selection_at_document_edge_does_not_collapse(self):
+        for below in (False, True):
+            with self.subTest(below=below):
+                clipboard = FakeClipboard("旧")
+                copier = FakeCopier(clipboard)
+                result = _grabber(clipboard, copier).grab_context(3, below=below, can_copy=lambda: True)
+                self.assertTrue(result.timed_out)
+                self.assertFalse(result.caret_uncertain)
+                self.assertEqual(copier.order, ["wait", ("select", 3, below), "copy"])
+
+    def test_context_copy_restores_from_the_correct_side(self):
+        for below in (False, True):
+            with self.subTest(below=below):
+                clipboard = FakeClipboard("旧")
+                copier = FakeCopier(clipboard, payload="code;\n")
+                result = _grabber(clipboard, copier).grab_context(3, below=below, can_copy=lambda: True)
+                self.assertEqual(result.text, "code;\n")
+                self.assertFalse(result.caret_uncertain)
+                self.assertEqual(copier.order, ["wait", ("select", 3, below), "copy",
+                                                ("move", 6, below), "copy"])
+                self.assertEqual(clipboard.text, "旧")
+
+    def test_remaining_selection_marks_context_unusable(self):
         clipboard = FakeClipboard("旧")
-        copier = FakeCopier(clipboard, payload="x", fail=True)
-        result = _grabber(clipboard, copier).grab_lines(4)
+        copier = FakeCopier(clipboard, payload="context")
+        copier.remaining_after_restore = "remaining"
+        result = _grabber(clipboard, copier).grab_context(3, below=False, can_copy=lambda: True)
+        self.assertTrue(result.caret_uncertain)
 
-        self.assertFalse(result.ok)
-        self.assertIn("right", copier.order, "按 Ctrl+C 失败也要把选区收掉")
+    def test_legacy_st_capture_collapses_toward_original_caret(self):
+        for below in (False, True):
+            with self.subTest(below=below):
+                clipboard = FakeClipboard("旧")
+                copier = FakeCopier(clipboard, payload="context")
+                result = _grabber(clipboard, copier).grab_context(
+                    3, below=below, can_copy=lambda: True, collapse_to_anchor=True)
+                self.assertEqual(result.text, "context")
+                self.assertFalse(result.caret_uncertain)
+                self.assertEqual(copier.order, ["wait", ("select", 3, below), "copy", ("collapse", below)])
+                self.assertEqual(clipboard.text, "旧")
 
-    def test_modifiers_stuck_does_nothing(self):
+    def test_whole_line_copy_after_restoration_does_not_cancel_context(self):
         clipboard = FakeClipboard("旧")
-        copier = FakeCopier(clipboard, ready=False)
-        result = _grabber(clipboard, copier).grab_lines(3)
+        copier = FakeCopier(clipboard, payload="context")
+        copier.remaining_after_restore = "current_line;\r\n"
+        clipboard.get_selected_text = mock.Mock(side_effect=["context", ""])
+        result = _grabber(clipboard, copier).grab_context(3, below=False, can_copy=lambda: True)
+        self.assertEqual(result.text, "context")
+        self.assertFalse(result.caret_uncertain)
+        self.assertEqual(clipboard.text, "旧")
 
-        self.assertTrue(result.modifiers_stuck)
-        self.assertEqual(copier.order, ["wait"], "没松手就什么都不该按")
+    def test_win32_selected_text_ignores_the_editor_line_marker(self):
+        from codepoint.platform_win import clipboard
 
-    def test_zero_lines_is_noop(self):
+        with mock.patch.object(clipboard, "_open_clipboard", return_value=True), \
+                mock.patch.object(clipboard, "_WHOLE_LINE", 0xC000), \
+                mock.patch.object(clipboard.user32, "IsClipboardFormatAvailable", return_value=True), \
+                mock.patch.object(clipboard.user32, "CloseClipboard"), \
+                mock.patch.object(clipboard, "_read_text", return_value="full line;\r\n"):
+            self.assertEqual(clipboard.get_text(), "full line;\r\n")
+            self.assertEqual(clipboard.get_text(selection_only=True), "")
+
+    def test_shift_arrows_submit_key_down_and_key_up_separately(self):
+        from codepoint.platform_win import input_simulator as sim
+
+        with mock.patch.object(sim, "modifiers_pressed", return_value=False), \
+                mock.patch.object(sim, "_send", return_value=1) as sent:
+            self.assertTrue(sim.select_context(2, below=False))
+        frames = [[(item.ki.wVk, item.ki.dwFlags) for item in call.args[0]]
+                  for call in sent.call_args_list]
+        self.assertEqual(frames, [[(sim.VK_SHIFT, 0)], [(sim.VK_UP, 0)],
+                                  [(sim.VK_UP, sim.KEYEVENTF_KEYUP)], [(sim.VK_UP, 0)],
+                                  [(sim.VK_UP, sim.KEYEVENTF_KEYUP)], [(sim.VK_SHIFT, sim.KEYEVENTF_KEYUP)]])
+
+    def test_windows_line_break_restores_with_one_shift_left(self):
+        from codepoint.platform_win import input_simulator
+
+        copier = FakeCopier(FakeClipboard("旧"), payload="\r\n")
+        result = _grabber(copier.clipboard, copier).grab_context(3, below=True, can_copy=lambda: True)
+        self.assertFalse(result.caret_uncertain)
+        self.assertIn(("move", 1, True), copier.order)
+        with mock.patch.object(input_simulator, "_shift_directions", return_value=True) as shifted:
+            self.assertTrue(input_simulator.move_context_endpoint(1, left=True))
+        shifted.assert_called_once_with(input_simulator.VK_LEFT, 1)
+
+    def test_multi_line_prefix_restores_one_step_per_character_and_newline(self):
+        copier = FakeCopier(FakeClipboard("旧"), payload="甲;\r\n乙")
+        result = _grabber(copier.clipboard, copier).grab_context(3, below=False, can_copy=lambda: True)
+        self.assertFalse(result.caret_uncertain)
+        self.assertIn(("move", 4, False), copier.order)
+
+    def test_extra_terminal_newline_is_corrected_by_reversing_a_step(self):
         clipboard = FakeClipboard("旧")
-        copier = FakeCopier(clipboard, payload="x")
-        result = _grabber(clipboard, copier).grab_lines(0)
+        copier = FakeCopier(clipboard, payload="\r\n\r\n")
+        moves = []
 
-        self.assertFalse(result.ok)
-        self.assertEqual(copier.order, [], "0 行就别碰键盘了")
+        def move(count, *, left):
+            moves.append((count, left))
+            copier.payload = "数" if len(moves) == 1 else None
+            return True
+
+        copier.move_context_endpoint = move
+        result = _grabber(clipboard, copier).grab_context(5, below=True, can_copy=lambda: True)
+        self.assertFalse(result.caret_uncertain)
+        self.assertEqual(moves, [(2, True), (1, False)])
+
+
+class TestAiContextDoesNotMoveCaret(unittest.TestCase):
+    def _run_worker(self, context, *, copied=GrabResult(), prefix=GrabResult(), suffix=GrabResult(),
+                    process_name=""):
+        import threading
+        from codepoint.app import App
+        from codepoint.core.events import WindowInfo
+        from codepoint.platform_win.focus_state import FocusState
+
+        app = App.__new__(App)
+        app.settings = Settings()
+        app._ai_cancel = threading.Event()
+        app._ai_busy = threading.Lock()
+        app._ai_busy.acquire()
+        app._grabber = mock.Mock()
+        app._grabber.grab.return_value = copied
+        app._grabber.grab_context.side_effect = [prefix, suffix]
+        app._scope_allows = mock.Mock(return_value=True)
+        app._injection_block_reason = mock.Mock(return_value="")
+        app._notify_safe = mock.Mock()
+        app._stream_updater = mock.Mock(return_value=None)
+        app._pipeline = mock.Mock()
+        backend = mock.Mock()
+        backend.complete.return_value = "rewritten;"
+        backend.complete_fim.return_value = "inserted;"
+        with mock.patch("codepoint.app.editor_context.read", return_value=context), \
+                mock.patch("codepoint.app.foreground.query", return_value=WindowInfo(
+                    hwnd=101, pid=100, process_name=process_name)), \
+                mock.patch("codepoint.app.focus_state.query", return_value=FocusState(hwnd=101, focus_hwnd=102)), \
+                mock.patch("codepoint.app.create_completer", return_value=backend):
+            app._ai_selection_worker(101)
+        return app, backend
+
+    def test_read_only_range_goes_to_model_without_copying(self):
+        from codepoint.platform_win.editor_context import EditorContext
+
+        app, backend = self._run_worker(EditorContext(prefix="x := ", suffix=";"))
+        app._grabber.grab.assert_not_called()
+        self.assertEqual(backend.complete_fim.call_args.args[:2], ("x := ", ";"))
+        app._pipeline.offer.assert_called_once()
+
+    def test_st_editors_use_legacy_capture_when_text_ranges_are_unavailable(self):
+        for process_name in ("invtmatic studio.exe", "codesys.exe"):
+            with self.subTest(process_name=process_name):
+                app, backend = self._run_worker(None, process_name=process_name,
+                                                prefix=GrabResult(text="x := "), suffix=GrabResult(text=";"))
+                calls = app._grabber.grab_context.call_args_list
+                self.assertEqual([(c.kwargs["below"], c.kwargs["collapse_to_anchor"]) for c in calls],
+                                 [(False, True), (True, True)])
+                self.assertEqual(backend.complete_fim.call_args.args[:2], ("x := ", ";"))
+                app._pipeline.offer.assert_called_once()
+
+    def test_unsupported_editor_uses_keyboard_context(self):
+        app, backend = self._run_worker(None, prefix=GrabResult(text="x := "),
+                                        suffix=GrabResult(text=";"))
+        calls = app._grabber.grab_context.call_args_list
+        self.assertEqual([(c.args[0], c.kwargs["below"]) for c in calls], [(6, False), (3, True)])
+        self.assertEqual(backend.complete_fim.call_args.args[:2], ("x := ", ";"))
+        app._pipeline.offer.assert_called_once()
+
+    def test_uncertain_caret_blocks_model_and_suffix_capture(self):
+        app, backend = self._run_worker(None, prefix=GrabResult(text="x := ", caret_uncertain=True))
+        app._grabber.grab_context.assert_called_once()
+        self.assertEqual(backend.method_calls, [])
+        app._pipeline.offer.assert_not_called()
+
+    def test_existing_selection_still_works_in_unsupported_editor(self):
+        app, backend = self._run_worker(None, copied=GrabResult(text="chosen;"))
+        backend.complete.assert_called_once_with("chosen;", on_delta=None)
+        app._pipeline.offer.assert_called_once()
+
+    def test_existing_whitespace_selection_is_not_used_as_a_context_anchor(self):
+        app, backend = self._run_worker(None, copied=GrabResult(text="\r\n"))
+        app._grabber.grab_context.assert_not_called()
+        self.assertEqual(backend.method_calls, [])
+
+    def test_st_blank_line_copy_continues_with_surrounding_context(self):
+        for process_name in ("invtmatic studio.exe", "codesys.exe"):
+            with self.subTest(process_name=process_name):
+                app, backend = self._run_worker(
+                    None, process_name=process_name, copied=GrabResult(text="\t \r\n"),
+                    prefix=GrabResult(text="CheckANDConfig := TRUE;\r\n\r\n"),
+                    suffix=GrabResult(text="\r\n// 下一段"))
+                backend.complete.assert_not_called()
+                self.assertEqual(backend.complete_fim.call_args.args[:2],
+                                 ("CheckANDConfig := TRUE;\r\n\r\n", "\r\n// 下一段"))
+                app._notify_safe.assert_not_called()
+                app._pipeline.offer.assert_called_once()
 
 
 # ---------------------------------------------------------------- 连接测试

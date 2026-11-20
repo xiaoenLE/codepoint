@@ -22,18 +22,29 @@ class TestPasteText(unittest.TestCase):
     def _run(self, *, old="老内容", text="新内容", set_ok=True, mods_released=True):
         calls = []
 
-        def fake_set(value):
+        def fake_swap(value, *, retries, on_written):
             calls.append(("set", value))
-            return set_ok
+            if set_ok:
+                on_written(42)
+                return old, 42
+            return None
+
+        def fake_set(value, *, expected_sequence, expected_text, on_written):
+            self.assertEqual(expected_sequence, 42)
+            self.assertEqual(expected_text, text)
+            calls.append(("set", value))
+            on_written(43)
+            return True
 
         with mock.patch.object(ins, "wait_modifiers_released",
                                return_value=mods_released), \
-                mock.patch.object(ins._clipboard, "get_text", return_value=old), \
+                mock.patch.object(ins._clipboard, "swap_text", side_effect=fake_swap), \
+                mock.patch.object(ins._clipboard, "sequence_number", return_value=42), \
                 mock.patch.object(ins._clipboard, "set_text", side_effect=fake_set), \
                 mock.patch.object(ins, "send_ctrl_key",
                                   side_effect=lambda vk: calls.append(("key", vk))), \
                 mock.patch.object(ins.time, "sleep"):
-            ok = ins.paste_text(text, suppress=lambda: calls.append(("suppress", None)))
+            ok = ins.paste_text(text, suppress=lambda seq: calls.append(("suppress", seq)))
         return ok, calls
 
     def test_pastes_via_ctrl_v(self):
@@ -55,12 +66,10 @@ class TestPasteText(unittest.TestCase):
         sets = [v for kind, v in calls if kind == "set"]
         self.assertEqual(sets, ["新内容"])
 
-    def test_suppress_runs_before_touching_clipboard(self):
-        """剪贴板净化器必须先被喊停，否则代码里的中文标点会被改掉。"""
+    def test_written_sequence_is_suppressed_before_paste(self):
         _ok, calls = self._run()
         kinds = [kind for kind, _ in calls]
-        self.assertLess(kinds.index("suppress"), kinds.index("set"),
-                        "要在改剪贴板之前 suppress")
+        self.assertEqual(kinds[:3], ["set", "suppress", "key"])
 
     def test_fails_when_clipboard_is_occupied(self):
         ok, calls = self._run(set_ok=False)
@@ -72,6 +81,36 @@ class TestPasteText(unittest.TestCase):
         ok, calls = self._run(mods_released=False)
         self.assertFalse(ok)
         self.assertNotIn(("key", ins.VK_V), calls)
+
+    def test_hook_paste_defers_restore_without_waiting(self):
+        with mock.patch.object(ins, "modifiers_pressed", return_value=False), \
+                mock.patch.object(ins, "wait_modifiers_released") as wait, \
+                mock.patch.object(ins._clipboard, "swap_text", return_value=("之前的文本", 42)) as swap, \
+                mock.patch.object(ins._clipboard, "sequence_number", return_value=42), \
+                mock.patch.object(ins._clipboard, "set_text") as restore, \
+                mock.patch.object(ins, "send_ctrl_key") as send, \
+                mock.patch.object(ins.threading, "Timer") as timer:
+            self.assertTrue(ins.paste_text("四行代码", from_hook=True))
+            _, restore_fn = timer.call_args.args
+            try:
+                wait.assert_not_called()
+                swap.assert_called_once_with("四行代码", retries=1, on_written=None)
+                send.assert_called_once_with(ins.VK_V)
+                restore.assert_not_called()
+                self.assertFalse(ins.paste_text("另一次粘贴", from_hook=True))
+            finally:
+                restore_fn(*timer.call_args.kwargs["args"])
+            restore.assert_called_once_with("之前的文本", expected_sequence=42,
+                                            expected_text="四行代码", on_written=None)
+
+    def test_restore_skips_a_newer_clipboard_copy(self):
+        clipboard = ins._clipboard
+        with mock.patch.object(clipboard, "_open_clipboard", return_value=True), \
+                mock.patch.object(clipboard, "sequence_number", return_value=43), \
+                mock.patch.object(clipboard, "_write_text") as write, \
+                mock.patch.object(clipboard.user32, "CloseClipboard"):
+            self.assertFalse(clipboard.set_text("之前的文本", expected_sequence=42))
+            write.assert_not_called()
 
 
 class TestInjectorAdapter(unittest.TestCase):
@@ -177,8 +216,8 @@ class TestAltNeverSentDuringPaste(unittest.TestCase):
 
         with mock.patch.object(ins, "_send", side_effect=fake_send), \
                 mock.patch.object(ins, "wait_modifiers_released", return_value=True), \
-                mock.patch.object(ins._clipboard, "get_text", return_value=None), \
-                mock.patch.object(ins._clipboard, "set_text", return_value=True), \
+                mock.patch.object(ins._clipboard, "swap_text", return_value=(None, 42)), \
+                mock.patch.object(ins._clipboard, "sequence_number", return_value=42), \
                 mock.patch.object(ins.time, "sleep"):
             ins.paste_text("x := 1;")
 

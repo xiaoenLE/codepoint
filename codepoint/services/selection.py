@@ -29,10 +29,14 @@ log = logging.getLogger("codepoint.selection")
 #: 按下 Ctrl+C 之后最多等多久（秒）。编辑器复制一点点文本是毫秒级的，
 #: 450ms 已经非常宽裕；再长只会在"什么都没选中"时白白卡住用户。
 DEFAULT_WAIT = 0.45
-#: 抓"前 N 行"要更宽裕一点：Shift+Up 是按行发的，行多了本身要几十毫秒，
-#: 编辑器还要先处理选区再复制。
-DEFAULT_LINE_WAIT = 0.7
 DEFAULT_POLL = 0.01
+RESTORE_CHECK_WAIT = 0.12
+LEGACY_PREFIX_WAIT = 0.7
+
+
+def _caret_steps(text: str) -> int:
+    # 从行尾走到下一行开头只有一次移动。Python 字符数也不会把 UTF-16 代理对算成两步。
+    return len(text.replace("\r\n", "\n"))
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,7 @@ class GrabResult:
     #: 用户一直按着 Ctrl/Alt 没松手 —— 此时**根本没发** Ctrl+C。
     #: 单独一个标记，是因为给用户的提示完全不同（"松手" vs "先选中"）。
     modifiers_stuck: bool = False
+    caret_uncertain: bool = False
 
     @property
     def ok(self) -> bool:
@@ -63,7 +68,6 @@ class SelectionGrabber:
         copier: SelectionCopier,
         *,
         wait: float = DEFAULT_WAIT,
-        line_wait: float = DEFAULT_LINE_WAIT,
         poll: float = DEFAULT_POLL,
         sleep: Optional[Callable[[float], None]] = None,
         monotonic: Optional[Callable[[], float]] = None,
@@ -71,14 +75,11 @@ class SelectionGrabber:
         self._clipboard = clipboard
         self._copier = copier
         self._wait = max(0.0, wait)
-        self._line_wait = max(self._wait, line_wait)
         self._poll = max(0.001, poll)
         self._sleep = sleep or time.sleep
         self._monotonic = monotonic or time.monotonic
 
-    def grab(self) -> GrabResult:
-        backup = self._read_backup()
-        before = self._sequence()
+    def grab(self, *, can_copy: Optional[Callable[[], bool]] = None) -> GrabResult:
 
         # ① 必须等修饰键松开再发 Ctrl+C。
         #    热键在"按下"那一刻触发，这时 Ctrl/Alt 还按着 —— 直接发就变成
@@ -88,6 +89,10 @@ class SelectionGrabber:
             log.info("修饰键一直没松开，本次不发送 Ctrl+C")
             return GrabResult(modifiers_stuck=True)
 
+        if can_copy is not None and not can_copy():
+            return GrabResult()
+        backup = self._read_backup()
+        before = self._sequence()
         try:
             self._copier.copy_selection()
         except Exception:      # noqa: BLE001 —— 按不出 Ctrl+C 就当作"没选中"
@@ -95,84 +100,89 @@ class SelectionGrabber:
             return GrabResult()
 
         text, timed_out = self._wait_for_change(before)
-        restored = self._restore(backup)
+        restored = not timed_out and self._restore(backup)
         return GrabResult(text=text, restored=restored, timed_out=timed_out)
 
-    def grab_lines(self, count: int) -> GrabResult:
-        """抓"光标上方 count 行"当上下文。
-
-        做法：Shift+Up × count 选中 → Ctrl+C → Right 取消选区（光标归位）。
-        这是没有 UIA 的编辑器（CODESYS / Invtmatic）唯一能取出上下文的办法。
-
-        ⚠ 无论中途发生什么，最后那次 Right **一定要发** —— 否则用户屏幕上
-          会留着一片蓝汪汪的选区，还不知道是谁弄的。
-        """
-        count = int(count)
-        if count <= 0:
+    def grab_context(self, count: int, *, below: bool, can_copy: Callable[[], bool],
+                     collapse_to_anchor: bool = False) -> GrabResult:
+        """临时选中并复制上下文，再收起选区。"""
+        if count <= 0 or not can_copy():
             return GrabResult()
-
-        backup = self._read_backup()
-        before = self._sequence()
-
         if not self._copier.wait_ready():
             return GrabResult(modifiers_stuck=True)
-
-        try:
-            self._copier.select_lines_up(count)
-            self._copier.copy_selection()
-        except Exception:      # noqa: BLE001
-            log.warning("抓上下文时按键失败", exc_info=True)
-            self._safe_cancel_selection()
-            return GrabResult()
-
-        text, timed_out = self._wait_for_change(before, wait=self._line_wait)
-        self._safe_cancel_selection()
-        restored = self._restore(backup)
-        return GrabResult(text=text, restored=restored, timed_out=timed_out)
-
-    def grab_lines_down(self, count: int) -> GrabResult:
-        """抓"光标下方 count 行"—— FIM 的 suffix。
-
-        做法：Shift+Down × count 选中 → Ctrl+C → **Left** 取消选区（光标归位）。
-
-        为什么取消要用 Left：向下选出来的选区，左端才是原来的光标位置；
-        用 Right（向上选时是对的）会把光标挪到下方那行的行尾去，
-        用户接着打字就插错地方了。
-
-        ⚠ 失败也要保证取消选区那次按键发出去，否则屏幕上留一片蓝。
-        """
-        count = int(count)
-        if count <= 0:
-            return GrabResult()
-
         backup = self._read_backup()
-        before = self._sequence()
-
-        if not self._copier.wait_ready():
-            return GrabResult(modifiers_stuck=True)
-
-        try:
-            self._copier.select_lines_down(count)
-            self._copier.copy_selection()
-        except Exception:      # noqa: BLE001
-            log.warning("抓下文时按键失败", exc_info=True)
-            self._safe_cancel_selection(to_start=True)
+        sequence = self._sequence()
+        caret = self._copier.caret_position()
+        if not can_copy():
             return GrabResult()
 
-        # 向下选的行数少（默认 3 行），用普通等待就够；这里多等没用，
-        # 光标在文件末尾时根本没东西可选，白等只会让用户觉得卡。
-        text, timed_out = self._wait_for_change(before, wait=self._wait)
-        self._safe_cancel_selection(to_start=True)
-        restored = self._restore(backup)
-        return GrabResult(text=text, restored=restored, timed_out=timed_out)
-
-    def _safe_cancel_selection(self, to_start: bool = False) -> None:
+        text, timed_out = "", True
+        selected = self._copier.select_context(count, below=below)
         try:
-            self._copier.cancel_selection(to_start=to_start)
+            if selected and can_copy():
+                self._copier.copy_selection()
+                wait = max(self._wait, LEGACY_PREFIX_WAIT) if collapse_to_anchor and not below else None
+                text, timed_out = self._wait_for_change(sequence, wait=wait)
         except Exception:      # noqa: BLE001
-            log.warning("取消选区失败（用户屏幕上可能留着一片选区）", exc_info=True)
+            log.warning("复制临时上下文选区失败", exc_info=True)
+
+        current = self._copier.caret_position() if can_copy() else None
+        moved = caret is not None and current is not None and caret != current
+        uncertain = not selected or (not text and moved)
+        if text:
+            if collapse_to_anchor:
+                # 兼容旧版 ST 抓取：上文锚点在选区右端，下文锚点在选区左端。
+                uncertain |= not can_copy() or not self._copier.collapse_selection(to_start=below)
+                current = self._copier.caret_position() if can_copy() else None
+                uncertain |= caret is not None and current is not None and caret != current
+            else:
+                uncertain |= not self._restore_anchor(text, left=below, can_copy=can_copy)
+
+        restored = not timed_out and can_copy() and self._restore(backup)
+        log.info("键盘抓取%s：请求 %d 行，复制 %d 字，%s",
+                 "下文" if below else "上文", count, len(text),
+                 "光标复位未确认" if uncertain else "无可用选区" if not text else "已复位")
+        return GrabResult(text=text, restored=restored, timed_out=timed_out,
+                          caret_uncertain=uncertain)
 
     # ------------------------------------------------------------ 内部
+
+    def _restore_anchor(self, text: str, *, left: bool, can_copy: Callable[[], bool]) -> bool:
+        total = _caret_steps(text)
+        if not can_copy() or not self._copier.move_context_endpoint(total, left=left):
+            return False
+        remaining = self._read_remaining_selection(can_copy)
+        if remaining == "":
+            return True
+        if remaining is None or _caret_steps(remaining) > total or not can_copy():
+            return False
+
+        # 有些编辑器在复制时附加不可走到的末尾换行。反方向试一步，比较选区变长还是变短。
+        if not self._copier.move_context_endpoint(1, left=not left):
+            return False
+        probed = self._read_remaining_selection(can_copy)
+        if probed == "":
+            return True
+        if probed is None or not can_copy():
+            return False
+        before, after = _caret_steps(remaining), _caret_steps(probed)
+        if before == after or after > total + 1:
+            return False
+        return (self._copier.move_context_endpoint(after, left=(left if after > before else not left))
+                and self._read_remaining_selection(can_copy) == "")
+
+    def _read_remaining_selection(self, can_copy: Callable[[], bool]) -> Optional[str]:
+        if not can_copy():
+            return None
+        # 用复制确认选区是否已消失，避免把滚动造成的坐标变化当作移动。
+        sequence = self._sequence()
+        try:
+            self._copier.copy_selection()
+            text, _ = self._wait_for_change(sequence, wait=RESTORE_CHECK_WAIT)
+            return text if can_copy() else None
+        except Exception:      # noqa: BLE001
+            log.warning("确认临时选区是否结束时失败", exc_info=True)
+            return None
 
     def _read_backup(self) -> Optional[str]:
         try:
@@ -186,18 +196,17 @@ class SelectionGrabber:
         except Exception:      # noqa: BLE001
             return 0
 
-    def _wait_for_change(self, before: int, *,
-                         wait: Optional[float] = None) -> tuple[str, bool]:
+    def _wait_for_change(self, before: int, *, wait: Optional[float] = None) -> tuple[str, bool]:
         """轮询到剪贴板序号变了为止。
 
         序号变了才去读内容：没选中东西时 Ctrl+C 不会碰剪贴板，
         序号不变，于是走到超时 —— 正好把"用户其实没选"这种情况区分出来。
         """
-        deadline = self._monotonic() + (self._wait if wait is None else max(0.0, wait))
+        deadline = self._monotonic() + (self._wait if wait is None else wait)
         while self._monotonic() < deadline:
             if self._sequence() != before:
                 try:
-                    value = self._clipboard.get_text()
+                    value = self._clipboard.get_selected_text()
                 except Exception:      # noqa: BLE001
                     value = None
                 if value is not None:

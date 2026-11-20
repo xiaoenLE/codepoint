@@ -9,14 +9,14 @@
 from __future__ import annotations
 
 import ctypes
+import threading
 import time
 from typing import List, Sequence
 
 from . import winapi as _w
 from . import clipboard as _clipboard
 from .keylayout import (
-    VK_BACK, VK_CONTROL, VK_DOWN, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT,
-    VK_TAB, VK_UP,
+    VK_BACK, VK_CONTROL, VK_DOWN, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 )
 from .winapi import (
     DWORD,
@@ -141,10 +141,11 @@ def send_vk(vk: int, down: bool = True) -> None:
 
 
 VK_V = 0x56
+_paste_lock = threading.Lock()
 
 
 def paste_text(text: str, *, suppress=None, restore: bool = True,
-               settle: float = 0.12) -> bool:
+               settle: float = 0.12, from_hook: bool = False) -> bool:
     """把 ``text`` 整段"粘贴"进去：塞剪贴板 → 一次 Ctrl+V → 还原原剪贴板。
 
     为什么要这条路径（用户提的，2026-10-21）：
@@ -156,46 +157,67 @@ def paste_text(text: str, *, suppress=None, restore: bool = True,
     把刚写的行重新缩进、弹出提示框吃掉后续字符…… 整段粘贴只有一个动作，
     这些中间态根本不会发生。
 
-    ``suppress``：在改剪贴板前调一下，让剪贴板监听器别把我们自己塞进去的
+    ``suppress``：写入后标记序号，让监听器跳过我们塞进去的
     内容当成"用户复制"再净化一遍（否则代码里的中文标点会被改写，粘贴出来的
     和预览的不一样）。
 
     ``settle``：粘贴后等多久再还原剪贴板。目标程序读剪贴板是异步的，
     还原太早可能让它读到旧内容（大段文本尤其明显）。
+    ``from_hook``：键盘钩子只尝试立即粘贴，剪贴板由后台定时恢复。
 
     返回 False 表示粘贴这条路走不通（剪贴板被占、修饰键还按着），
     调用方应当退回 ``send_unicode_text``。
     """
     if not text:
         return True
-    # Ctrl / Alt 还按着的时候发 Ctrl+V，会变成 Ctrl+Alt+V 之类的组合，谁都认不出来
-    if not wait_modifiers_released():
+    if not _paste_lock.acquire(blocking=False):
         return False
-
-    old = None
+    deferred = False
     try:
-        old = _clipboard.get_text()
-    except Exception:      # noqa: BLE001 —— 读不到就当作"原来没有文本"，不挡路
-        old = None
+        if from_hook:
+            if modifiers_pressed():
+                return False
+        elif not wait_modifiers_released():
+            return False
 
-    def _quiet() -> None:
-        if suppress is not None:
-            try:
-                suppress()
-            except Exception:      # noqa: BLE001
-                pass
+        swapped = _clipboard.swap_text(text, retries=1 if from_hook else 6,
+                                       on_written=suppress)
+        if swapped is None:
+            return False
+        old, sequence = swapped
+        send_needed = _clipboard.sequence_number() == sequence
+        try:
+            if send_needed:
+                send_ctrl_key(VK_V)
+        finally:
+            if send_needed and restore and old is not None and old != text:
+                delay = max(0.0, settle)
+                if from_hook:
+                    timer = threading.Timer(delay, _restore_clipboard,
+                                            args=(old, text, sequence, suppress))
+                    timer.daemon = False   # 正常退出时也要把用户的文本还回去
+                    try:
+                        timer.start()
+                    except RuntimeError:
+                        pass   # 后台线程启动失败时，仍在当前线程完成恢复
+                    else:
+                        deferred = True
+                if not deferred:
+                    time.sleep(delay)
+                    _clipboard.set_text(old, expected_sequence=sequence,
+                                        expected_text=text, on_written=suppress)
+        return send_needed
+    finally:
+        if not deferred:
+            _paste_lock.release()
 
-    _quiet()
-    if not _clipboard.set_text(text):
-        return False
 
-    send_ctrl_key(VK_V)
-    time.sleep(max(0.0, settle))
-
-    if restore and old is not None and old != text:
-        _quiet()
-        _clipboard.set_text(old)
-    return True
+def _restore_clipboard(old: str, temporary: str, sequence: int, suppress) -> None:
+    try:
+        _clipboard.set_text(old, expected_sequence=sequence,
+                            expected_text=temporary, on_written=suppress)
+    finally:
+        _paste_lock.release()
 
 
 # ------------------------------------------------------------------ 输入法守卫键
@@ -402,59 +424,37 @@ def copy_selection() -> None:
     send_ctrl_key(VK_C)
 
 
-# ------------------------------------------------------------------ 上下文抓取
-#
-# 要预测"接下来写什么"，就得知道"上面写了什么"。UIA 在 CODESYS 上读不到正文，
-# 所以只能用键盘把上面几行**选中再复制**出来：
-#
-#     Shift+Up × N  →  Ctrl+C  →  Right（取消选区、光标归位）
-#
-# 中间的 Right 很关键：有选区时按右方向键，Windows 编辑器的标准行为是
-# "取消选区并把光标放到选区右端"—— 那一端就是原来的光标位置，于是用户
-# 什么都没察觉，除了屏幕上闪了一下。
+def select_context(count: int, *, below: bool) -> bool:
+    """用 Shift 和方向键扩展选区，返回按键是否全部送出。"""
+    return _shift_directions(VK_DOWN if below else VK_UP, count)
 
-def select_lines_up(count: int) -> None:
-    """Shift+Up × count：选中光标上方的 count 行。"""
-    count = int(count)
-    if count <= 0:
-        return
-    _send([_make_key_input(VK_SHIFT, 0, 0)])
+
+def move_context_endpoint(count: int, *, left: bool) -> bool:
+    """保持 Shift，移动临时选区的活动端。"""
+    return _shift_directions(VK_LEFT if left else VK_RIGHT, count)
+
+
+def collapse_selection(*, to_start: bool) -> bool:
+    return not modifiers_pressed() and _send_direction(VK_LEFT if to_start else VK_RIGHT)
+
+
+def _shift_directions(key: int, count: int) -> bool:
+    if count <= 0 or modifiers_pressed():
+        return False
+    if _send([_make_key_input(VK_SHIFT)]) != 1:
+        return False
     try:
         for _ in range(count):
-            _send([_make_key_input(VK_UP, 0, 0)])
-            _send([_make_key_input(VK_UP, 0, KEYEVENTF_KEYUP)])
-    finally:
-        # 无论中途出什么事，Shift 一定要抬起来 —— 卡住的话用户后面
-        # 敲的每个字符都会变成大写/符号，而且它不会被钩子自愈。
-        _release_modifier(VK_SHIFT)
-
-
-def select_lines_down(count: int) -> None:
-    """Shift+Down × count：选中光标下方的 count 行。
-
-    FIM 用它取「光标后面已经写了什么」。和向上选一样按行发键，
-    Shift 放在 finally 里抬 —— 卡住的话用户后面敲的每个字符都会变形。
-    """
-    count = int(count)
-    if count <= 0:
-        return
-    _send([_make_key_input(VK_SHIFT, 0, 0)])
-    try:
-        for _ in range(count):
-            _send([_make_key_input(VK_DOWN, 0, 0)])
-            _send([_make_key_input(VK_DOWN, 0, KEYEVENTF_KEYUP)])
+            if not _send_direction(key):
+                return False
+        return True
     finally:
         _release_modifier(VK_SHIFT)
 
 
-def cancel_selection(to_start: bool = False) -> None:
-    """取消选区，并把光标放回**原来那一点**。
-
-    向上选（Shift+Up）出来的选区，右端 = 原位，要按 Right；
-    向下选（Shift+Down）出来的选区，左端 = 原位，要按 Left。
-    端搞反了光标会跑到文件后面去 —— 用户接着打字就打错地方，
-    而且他根本想不到是补全工具干的。
-    """
-    vk = VK_LEFT if to_start else VK_RIGHT
-    _send([_make_key_input(vk, 0, 0)])
-    _send([_make_key_input(vk, 0, KEYEVENTF_KEYUP)])
+def _send_direction(key: int) -> bool:
+    # 与原有上下文抓取时序一致，每次按下和抬起分别提交。
+    if _send([_make_key_input(key)]) != 1:
+        return False
+    up = _make_key_input(key, flags=KEYEVENTF_KEYUP)
+    return _send([up]) == 1 or _send([up]) == 1

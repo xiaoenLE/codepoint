@@ -1,16 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_submodules
+import argparse
 
-hiddenimports = []
-hiddenimports += collect_submodules('codepoint')
+parser = argparse.ArgumentParser()
+parser.add_argument('--onedir', action='store_true')
+args = parser.parse_args()
 
 
 a = Analysis(
     ['main.py'],
     pathex=['.'],
     binaries=[],
-    datas=[],
-    hiddenimports=hiddenimports,
+    datas=[('build/icon.ico', 'build')],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -23,14 +24,15 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
+    [] if args.onedir else a.binaries,
+    [] if args.onedir else a.datas,
     [],
+    exclude_binaries=args.onedir,
     name='CodePoint',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=not args.onedir,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
@@ -42,3 +44,10 @@ exe = EXE(
     version='build/version_info.txt',
     icon=['build/icon.ico'],
 )
+
+if args.onedir:
+    # Windows 10+ supplies UCRT and its API sets. Keep the separate VC runtime.
+    binaries = [entry for entry in a.binaries
+                if entry[0].lower() != 'ucrtbase.dll'
+                and not entry[0].lower().startswith('api-ms-win-')]
+    coll = COLLECT(exe, binaries, a.datas, name='CodePoint', upx=False)

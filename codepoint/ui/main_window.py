@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 import tkinter as tk
 from typing import Callable, Dict, Optional, Tuple
 
@@ -32,6 +33,7 @@ from ..core import window_geom as geom
 from .bridge import UiBridge
 from .card import CardLook, CardWindow
 from .pages.about_page import AboutPage
+from .pages.base import Page
 from .pages.general_page import GeneralPage
 from .pages.home_page import HomePage
 from .pages.quick_page import QuickActionPage
@@ -54,6 +56,14 @@ NAV_ITEMS = (
     (PAGE_ABOUT, "关于"),
 )
 
+_PAGE_FACTORIES = {
+    PAGE_HOME: HomePage,
+    PAGE_RULES: partial(PunctuationPage, title="标点符号表"),
+    PAGE_QUICK: partial(QuickActionPage, title="快捷输入列表"),
+    PAGE_GENERAL: GeneralPage,
+    PAGE_ABOUT: AboutPage,
+}
+
 _PUMP_INTERVAL_MS = 30
 _SYNC_INTERVAL_MS = 4000
 
@@ -74,7 +84,7 @@ class MainWindow:
         self._facade = facade
         self._bridge = bridge
         self._positioner = positioner
-        self._start_hidden = start_hidden
+        self._start_hidden = start_hidden or facade.get_settings().start_hidden
         # 主窗口该放哪儿：由组装根注入一个"当前工作区矩形"，居中和夹取
         # 用 core.window_geom 的纯函数算（可单测）。
         # **绝不能拿呼吸灯那个 positioner 来定位主窗口** —— 它返回的是
@@ -85,10 +95,12 @@ class MainWindow:
         self._pump_job: Optional[str] = None
         self._sync_job: Optional[str] = None
         self._nav: Dict[str, _NavButton] = {}
-        self._pages: Dict[str, tk.Frame] = {}
+        self._pages: Dict[str, Page] = {}
         self._page = PAGE_HOME
 
         self.root = tk.Tk()
+        if self._start_hidden:
+            self.root.withdraw()
         self.root.title(APP_DISPLAY_NAME)
         theme.apply(self.root)                 # 选字体（必须在建控件之前）
         self.root.configure(bg=theme.BG)
@@ -184,9 +196,9 @@ class MainWindow:
         self._footer = _Footer(self.root, logo=self._footer_logo)
         self._footer.pack(side="bottom", fill="x")
 
-        self._build_pages()
         self._sync_switch()
-        self.show_page(PAGE_HOME)
+        if not self._start_hidden:
+            self.show_page(PAGE_HOME)
 
     def _build_topbar(self) -> None:
         bar = tk.Frame(self.root, bg=theme.TOPBAR_BG, height=theme.TOPBAR_H)
@@ -226,51 +238,33 @@ class MainWindow:
                                      fg=theme.TEXT_MUTED, font=theme.F_BODY)
         self.switch_label.pack(side="right", padx=(0, 8))
 
-    def _build_pages(self) -> None:
-        self._pages = {
-            PAGE_HOME: HomePage(self._column, self._facade),
-            PAGE_RULES: PunctuationPage(self._column, self._facade,
-                                        title="标点符号表"),
-            PAGE_QUICK: QuickActionPage(self._column, self._facade,
-                                        title="快捷输入列表"),
-            PAGE_GENERAL: GeneralPage(self._column, self._facade),
-            PAGE_ABOUT: AboutPage(self._column, self._facade),
-        }
-        for page in self._pages.values():
-            page.place(relx=0, rely=0, relwidth=1, relheight=1)
-            page.place_forget()
-
     # ------------------------------------------------------------ 页面切换
 
     def show_page(self, page: str) -> None:
-        if page not in self._pages:
+        if page not in _PAGE_FACTORIES:
             page = PAGE_HOME
+        previous = self._pages.get(self._page)
+        target = self._pages.get(page)
+        if target is None:
+            target = self._pages[page] = _PAGE_FACTORIES[page](self._column, self._facade)
         self._page = page
         for key, btn in self._nav.items():
             btn.set_active(key == page)
 
-        target = self._pages[page]
-        for widget in self._pages.values():
-            widget.place_forget()
+        if previous is not None and previous is not target:
+            previous.place_forget()
+            if isinstance(previous, HomePage):
+                previous.stop()
         target.place(relx=0, rely=0, relwidth=1, relheight=1)
-        if hasattr(target, "refresh"):
-            try:
-                target.refresh()
-            except Exception:      # noqa: BLE001
-                pass
-
-        # 离开主页就停掉它的前台轮询（省 CPU）
-        home = self._pages.get(PAGE_HOME)
-        if isinstance(home, HomePage) and page != PAGE_HOME:
-            home.stop()
+        self.refresh_all()
 
     def refresh_all(self) -> None:
-        for page in self._pages.values():
-            if hasattr(page, "refresh"):
-                try:
-                    page.refresh()      # noqa: PERF203
-                except Exception:      # noqa: BLE001
-                    pass
+        page = self._pages.get(self._page)
+        if page is not None and self.root.state() != "withdrawn":
+            try:
+                page.refresh()
+            except Exception:      # noqa: BLE001
+                pass
         self._sync_switch()
 
     # ------------------------------------------------------------ 开关
@@ -292,8 +286,6 @@ class MainWindow:
     def run(self) -> None:
         self._pump()
         self._periodic_sync()
-        if self._start_hidden or self._facade.get_settings().start_hidden:
-            self.root.withdraw()
         self.root.mainloop()
 
     def show(self) -> None:
@@ -303,8 +295,11 @@ class MainWindow:
         点托盘菜单的"打开"。三种都走这里。
         """
         try:
+            was_hidden = self.root.state() == "withdrawn"
             self.ensure_visible()          # 先确认它还看得见，再谈置顶
             self.root.deiconify()
+            if was_hidden:
+                self.show_page(self._page)
             if self.root.state() == "iconic":
                 self.root.state("normal")
             self.root.lift()
@@ -325,6 +320,9 @@ class MainWindow:
     def hide(self) -> None:
         try:
             self.root.withdraw()
+            home = self._pages.get(PAGE_HOME)
+            if isinstance(home, HomePage):
+                home.stop()
         except Exception:      # noqa: BLE001
             pass
 

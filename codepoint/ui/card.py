@@ -90,6 +90,9 @@ class CardWindow:
         #: 生成中起始时刻（显示"已等 Ns"用）—— 推理模型要静默十几秒才出正文
         self._busy_at: Optional[float] = None
         self._hint_job: Optional[str] = None
+        self._first_row = 0
+        self._last_first_row = 0
+        self._visible_rows = 0
 
     # ------------------------------------------------------------ 外观
 
@@ -114,6 +117,7 @@ class CardWindow:
     def show(self, card: Card, x: int, y: int) -> None:
         win = self._ensure()
         self._card = card
+        self._first_row = 0
         # ⚠ 倒计时的值必须**在 _draw 之前**设好 —— _draw 会读它来决定
         #   标题栏右侧显示什么。放在后面的话第一帧没有秒数，要等 1 秒
         #   后第一次 tick 才补上（看着像"倒计时没生效"）。
@@ -222,6 +226,9 @@ class CardWindow:
         win.configure(bg=self._look.bg)
         canvas = tk.Canvas(win, bg=self._look.bg, highlightthickness=0, bd=0)
         canvas.pack()
+        canvas.bind("<MouseWheel>", self._on_mouse_wheel)
+        canvas.tag_bind("previous_page", "<Button-1>", lambda _: self._scroll(-self._visible_rows))
+        canvas.tag_bind("next_page", "<Button-1>", lambda _: self._scroll(self._visible_rows))
         self._win = win
         self._canvas = canvas
         self._no_activate_applied = False
@@ -258,11 +265,18 @@ class CardWindow:
         title_font = tkfont.Font(family=theme.family(), size=max(8, size - 1),
                                  weight="bold")
 
-        inner_max = max(120, look.max_width - _PAD * 2)
-        lines = self._body_lines(card.body, code_font, inner_max, look.max_lines)
-
         line_h = max(14, code_font.metrics("linespace"))
-        body_w = max([code_font.measure(line) for line in lines] or [0])
+        inner_max = max(120, look.max_width - _PAD * 2)
+        all_lines = self._body_lines(card.body, code_font, inner_max)
+        screen_rows = max(1, (canvas.winfo_screenheight() - 130) // line_h)
+        rows = max(1, min(look.max_lines, screen_rows))
+        self._last_first_row = max(0, len(all_lines) - rows)
+        self._first_row = min(self._first_row, self._last_first_row)
+        if card.state == STATE_BUSY:
+            self._first_row = self._last_first_row
+        lines = all_lines[self._first_row:self._first_row + rows]
+        self._visible_rows = len(lines)
+        body_w = max((code_font.measure(line) for line in all_lines), default=0)
         body_h = line_h * len(lines) if lines else 0
 
         label_w = title_font.measure(card.label) if card.label else 0
@@ -273,6 +287,8 @@ class CardWindow:
         width = max(body_w, header_w) + _PAD * 2
         width = max(180, min(width, look.max_width))
         height = _PAD * 2 + _HEADER_H + (_BODY_GAP + body_h if lines else 0)
+        if self._last_first_row:
+            height += _HEADER_H + _BODY_GAP
 
         canvas.configure(width=width, height=height)
         widgets.rounded_rect(canvas, 0, 0, width - 1, height - 1, 10,
@@ -294,24 +310,52 @@ class CardWindow:
 
         if not lines:
             return
-        # 正文：逐行画（比一整段 create_text 更容易控行距和截断）
+        # 正文：逐行画。换行只影响显示，插入仍使用原始代码。
         y = _PAD + _HEADER_H + _BODY_GAP
         for line in lines:
             canvas.create_text(_PAD, y, text=line, anchor="nw",
                                fill=look.fg, font=code_font)
             y += line_h
+        if self._last_first_row:
+            self._draw_scroll_controls(canvas, ui_font, y + _BODY_GAP + _HEADER_H / 2,
+                                       width, len(lines), len(all_lines))
 
     def _body_lines(self, body: str, font: tkfont.Font,
-                    limit_px: int, max_lines: int) -> List[str]:
+                    limit_px: int) -> List[str]:
         if not body:
             return []
         raw = body.replace("\r\n", "\n").replace("\t", "    ").split("\n")
         out: List[str] = []
-        for line in raw[:max_lines]:
-            out.append(_ellipsize(line, font, limit_px))
-        if len(raw) > max_lines:
-            out.append(f"… 还有 {len(raw) - max_lines} 行")
+        for line in raw:
+            while line and font.measure(line) > limit_px:
+                end = _fitting_length(line, font, limit_px)
+                out.append(line[:end])
+                line = line[end:]
+            out.append(line)
         return out
+
+    def _draw_scroll_controls(self, canvas, font, y: float, width: int,
+                              visible: int, total: int) -> None:
+        fg = self._muted(self._look.fg)
+        canvas.create_text(_PAD, y, anchor="w", fill=fg, font=font,
+                           text=f"{self._first_row + 1}–{self._first_row + visible} / {total}")
+        if self._card is None or self._card.state == STATE_BUSY:
+            return
+        for label, offset, tag in (("上一页", 55, "previous_page"), ("下一页", 0, "next_page")):
+            canvas.create_text(width - _PAD - offset, y, text=label, tags=(tag,),
+                               anchor="e", fill=self._look.fg, font=font)
+
+    def _on_mouse_wheel(self, event) -> None:
+        if event.delta:
+            self._scroll(-3 if event.delta > 0 else 3)
+
+    def _scroll(self, rows: int) -> None:
+        if self._card is None or self._card.state == STATE_BUSY:
+            return
+        first = max(0, min(self._first_row + rows, self._last_first_row))
+        if first != self._first_row:
+            self._first_row = first
+            self._draw(self._card)
 
     @staticmethod
     def _muted(fg: str) -> str:
@@ -462,18 +506,16 @@ class CardWindow:
         self._no_activate_applied = True
 
 
-def _ellipsize(line: str, font: tkfont.Font, limit_px: int) -> str:
-    """把超宽的一行截断成 ``前缀…``。用二分找断点，避免长行把窗口撑到屏幕外。"""
-    if not line or font.measure(line) <= limit_px:
-        return line
-    lo, hi = 0, len(line)
+def _fitting_length(line: str, font: tkfont.Font, limit_px: int) -> int:
+    """找出能放在当前预览宽度里的字符数。"""
+    lo, hi = 1, len(line)
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if font.measure(line[:mid] + "…") <= limit_px:
+        if font.measure(line[:mid]) <= limit_px:
             lo = mid
         else:
             hi = mid - 1
-    return line[:lo] + "…"
+    return lo
 
 
 __all__ = [

@@ -23,7 +23,7 @@ class ClipboardListener:
         self._on_change = on_change
         self._installed = False
         self._last_seq = 0
-        self._ignore_until_seq = 0
+        self._suppressed_seq = 0
         message_window.add_handler(WM_CLIPBOARDUPDATE, self._handle)
 
     # ------------------------------------------------------------ 生命周期
@@ -60,9 +60,12 @@ class ClipboardListener:
 
     # ------------------------------------------------------------ 通知抑制
 
-    def suppress_next(self) -> None:
-        """预期自己即将写剪贴板时调用，跳过下一次通知。"""
-        self._ignore_until_seq = clipboard.sequence_number() + 1
+    def suppress(self, sequence: int) -> None:
+        """标记由本程序写入的剪贴板更新。"""
+        self._suppressed_seq = sequence
+
+    def is_suppressed(self, sequence: int) -> bool:
+        return sequence == self._suppressed_seq
 
     # ------------------------------------------------------------ 回调
 
@@ -71,8 +74,7 @@ class ClipboardListener:
         if seq == self._last_seq:
             return
         self._last_seq = seq
-        if seq <= self._ignore_until_seq:
-            self._ignore_until_seq = 0
+        if self.is_suppressed(seq):
             return
         try:
             self._on_change()

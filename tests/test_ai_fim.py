@@ -163,6 +163,25 @@ class TestCompleteFim(unittest.TestCase):
         self.assertNotIn("suffix", sent)
         self.assertEqual(out, "b := 2;")
 
+    def test_number_sequence_bypasses_fim_with_blank_suffix(self):
+        for strategy in ("server", "token"):
+            with self.subTest(strategy=strategy):
+                seen = []
+                with mock.patch("urllib.request.urlopen") as opened:
+                    out = self._completer().complete_fim(
+                        "x := 123;\r\n4\r\n5\r\n6\r\n7\r\n8\r\n", "\r\n",
+                        ai.MAX_AUTO_LINES, on_delta=seen.append, strategy=strategy)
+                opened.assert_not_called()
+                self.assertEqual(out, "9\n10\n11\n12\n13\n14")
+                self.assertEqual(seen, [out])
+
+    def test_nonblank_suffix_is_preserved_for_fim(self):
+        with mock.patch("urllib.request.urlopen", return_value=_resp(_text("9\n"))) as opened:
+            out = self._completer().complete_fim("7\n8\n", "10\n", strategy="server")
+        sent = json.loads(opened.call_args.args[0].data)
+        self.assertEqual(sent["suffix"], "10\n")
+        self.assertEqual(out, "9")
+
     def test_deepseek_token_strategy(self):
         with mock.patch("urllib.request.urlopen",
                         return_value=_resp(_text("x := 1;"))) as opened:
@@ -211,13 +230,7 @@ class TestCompleteFim(unittest.TestCase):
         # 推给界面的也必须是剪过的，不能先给带尾巴的
         self.assertEqual(seen[-1], "x := 1;")
 
-    def test_stops_streaming_once_past_the_line_limit(self):
-        """写超行数上限后要主动收工，别让用户盯着"生成中"干等。
-
-        FIM 没有"写几行就停"的约束，模型会一直写到 max_tokens；而卡片只显示
-        前 N 行 —— 多出来的横竖会被截掉，继续等就是白等（用户报障：
-        "都没有继续生成了，为什么还等那么久"）。
-        """
+    def test_stream_over_size_guard_discards_incomplete_output(self):
         frames = ["data: " + json.dumps({"choices": [{"text": "l%d;\n" % i}]})
                   for i in range(30)]
         frames.append("data: [DONE]")
@@ -225,9 +238,20 @@ class TestCompleteFim(unittest.TestCase):
 
         seen = []
         with mock.patch("urllib.request.urlopen", return_value=_bytes(body)):
-            out = self._completer().complete_fim("a;\n", "", 5, on_delta=seen.append)
-        self.assertLessEqual(len(out.split("\n")), 5)
+            with self.assertRaises(ai.AiOutputIncomplete):
+                self._completer().complete_fim("a;\n", "", 5, on_delta=seen.append)
         self.assertLessEqual(len(seen[-1].split("\n")), 5)
+
+    def test_stops_at_echoed_suffix_before_extra_code(self):
+        suffix = "    finalize();\nEND_IF;"
+        parts = ["    step();\n", suffix + "\n", "new_example();\n"]
+        frames = ["data: " + json.dumps({"choices": [{"text": part}]}) for part in parts]
+        seen = []
+        with mock.patch("urllib.request.urlopen", return_value=_bytes(("\n".join(frames) + "\n").encode())):
+            out = self._completer().complete_fim("IF ready THEN\n", suffix, ai.MAX_AUTO_LINES,
+                                                 on_delta=seen.append, strategy="server")
+        self.assertEqual(out, "    step();")
+        self.assertEqual(len(seen), 2)
 
     def test_missing_model_raises(self):
         with self.assertRaises(ValueError):
@@ -304,6 +328,32 @@ class TestGenerationNotTiedToDisplay(unittest.TestCase):
         self.assertEqual(sent["max_tokens"], 777)
         # 行数照常写进提示词，它只是"希望写几行"，不是硬掐
         self.assertIn("最多 24 行", sent["messages"][-1]["content"])
+
+    def test_chat_hint_does_not_remove_the_closing_lines(self):
+        code = "IF ready THEN\n    step();\n    finish();\nEND_IF;"
+        payload = {"choices": [{"message": {"content": code}, "finish_reason": "stop"}]}
+        with mock.patch("urllib.request.urlopen", return_value=_resp(payload)):
+            out = ai.OpenAiCompleter(base_url="http://x/v1", model="m").complete_lines("start();\n", 2)
+        self.assertEqual(out, code)
+
+    def test_length_finish_does_not_offer_partial_code(self):
+        frame = {"choices": [{"delta": {"content": "IF ready THEN"}, "finish_reason": "length"}]}
+        stream = ("data: " + json.dumps(frame) + "\n").encode()
+        with mock.patch("urllib.request.urlopen", return_value=_bytes(stream)):
+            with self.assertRaisesRegex(ai.AiOutputIncomplete, "输出上限"):
+                ai.OpenAiCompleter(base_url="http://x/v1", model="m").complete_lines(
+                    "start();\n", on_delta=lambda _: None)
+
+    def test_normal_finish_stops_stream_without_waiting_for_done(self):
+        frames = [
+            {"choices": [{"delta": {"content": "ready();"}, "finish_reason": "stop"}]},
+            {"choices": [{"delta": {"content": "extra();"}}]},
+        ]
+        stream = ("\n".join("data: " + json.dumps(frame) for frame in frames) + "\n").encode()
+        with mock.patch("urllib.request.urlopen", return_value=_bytes(stream)):
+            out = ai.OpenAiCompleter(base_url="http://x/v1", model="m").complete_lines(
+                "start();\n", on_delta=lambda _: None)
+        self.assertEqual(out, "ready();")
 
 
 # ---------------------------------------------------------------- 演练 / 协议

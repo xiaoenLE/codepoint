@@ -28,7 +28,6 @@ from ..core.events import (
     KeyPress,
     VK_ESCAPE,
     VK_TAB,
-    WindowInfo,
 )
 from ..core.card import Card
 from ..core.defaults import text_conversion_map
@@ -120,8 +119,6 @@ class KeyboardPipeline:
         self._cancel_hook = cancel_hook
         self._enabled = True
         self._stats = PipelineStats()
-        # 缓存上一帧的前台窗口，避免每次按键都做一次系统调用
-        self._last_window: WindowInfo = WindowInfo()
         # —— AI 补全：只保留"挂起等确认"这一半 ——
         # 生成在 app 的热键线程里做（那一头要在按键前后操作剪贴板），
         # "弹窗还是直接插"也由 app 根据 ai_card_enabled 决定。
@@ -194,7 +191,6 @@ class KeyboardPipeline:
             return False
 
         window = self._windows.front()
-        self._last_window = window
 
         # 窗口切换 → 重置快捷输入状态
         switched = self._quick.on_window(window.hwnd)
@@ -226,10 +222,13 @@ class KeyboardPipeline:
             # 否则代码会落在错误的地方。宁可丢掉，也不能插错。
             self.cancel_pending()
 
+        if not targeted:
+            return False
+
         # ③ Tab（必须在标点之前，否则 Tab 会被当成普通键）
         #    两条路：有待确认的片段 → 老逻辑（同步补全）；
         #            没有 pending 但缓冲区是 `//ai 参数` → 派发给后台模型。
-        if targeted and key.vk == VK_TAB:
+        if key.vk == VK_TAB:
             if self._quick.pending is not None:
                 result = self._quick.accept(self._now())
                 self._notifier.hide()
@@ -250,29 +249,26 @@ class KeyboardPipeline:
         #    ⚠ 输入法状态查询要跨进程调 IMM，是整个回调里最贵的动作。
         #    只有"这个键真有可能命中标点规则"时才去查——字母数字按键直接跳过。
         maybe_target = (
-            targeted
-            and key.char is not None
+            key.char is not None
             and not key.modifiers.has_command
             and self._punctuation.is_target(key.char)
         )
         ime = self._ime.state(window.hwnd) if maybe_target else UNAVAILABLE_IME
-        outcome = self._punctuation.decide(key, window, ime, targeted=targeted)
+        outcome = self._punctuation.decide(key, window, ime, targeted=True)
         swallow = outcome.swallow
         emit = outcome.emit if outcome.replaced else None
         effective_char = emit if emit is not None else key.char
 
         if outcome.replaced:
             self._stats.last_reason = f"标点替换：{emit}"
-        elif targeted:
+        else:
             self._stats.last_reason = outcome.reason
             # 留一份"为什么不转换"的计数：用户报障时功能往往已经恢复
             # （重启就好），这是唯一还能事后复盘的现场。
             self._stats.note_block(outcome.reason)
 
         # ⑤ 快捷输入
-        result = qa.FeedResult()
-        if targeted:
-            result = self._quick.feed(key, effective_char, self._now())
+        result = self._quick.feed(key, effective_char, self._now())
 
         backspaces = 0
         completion_text = None

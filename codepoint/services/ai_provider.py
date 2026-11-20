@@ -25,6 +25,7 @@ import logging
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
@@ -34,15 +35,19 @@ log = logging.getLogger("codepoint.ai")
 PROVIDER_MOCK = "mock"
 PROVIDER_OPENAI = "openai"
 
-#: 系统提示词（生成一整块）。**不绑定任何语言** —— 用户可能要 ST、C、Python，
-#: 写死了就会把 Python 需求也答成 ST。语言一律跟随用户给的上下文/需求。
+
+class AiOutputIncomplete(ValueError):
+    """后端提前截断，或输出超过可安全预览的范围。"""
+
+#: 有选区时，结果会整体替换选中的文字。选区既可以是代码，也可以是自然语言需求。
 DEFAULT_SYSTEM = (
-    "你是编程助手，能写 IEC 61131-3 ST、C、Python 等各种语言的代码。\n"
-    "规则：\n"
-    "1. 用什么语言：跟随用户需求和参考代码里的语言；用户没明说也看不出时才问。\n"
-    "2. 只输出代码本身。不要 Markdown 代码围栏，不要任何解释、不要说明文字。\n"
-    "3. 缩进宽度、命名风格、关键字大小写都与参考代码保持一致。\n"
-    "4. 拿不准就给最朴素、能编译/能运行的写法，不要发明不存在的库函数。"
+    "输出会直接替换编辑器里选中的文字。\n"
+    "选中的是需求时，按需求生成代码，语言跟随明确要求或参考代码。\n"
+    "选中的是代码时，返回完整的替换片段。按明确要求改写；没有明确要求时，只修复能确定的问题，"
+    "保留接口、行为、单位和变量含义。沿用原有语言、缩进、命名和注释。\n"
+    "选中的是数字或其他纯文本数据时，保留原格式。\n"
+    "只输出能直接替换选区的内容，不加解释、标题或 Markdown 围栏。"
+    "信息不足或没有必要改动时，输出空文本。"
 )
 
 
@@ -55,17 +60,11 @@ DEFAULT_SYSTEM = (
 #:   三题从 6/12 掉到 3/12 —— 1.5B 这种小模型会被长规则带跑，开始照抄上文。
 #:   所以规律性问题改由 `index_pattern_hint` 在代码里算好、只对认得出的场景补一句。
 COMPLETION_SYSTEM = (
-    "你是代码补全引擎。\n"
-    "用户给你光标之前的代码，你要接着往下写出最可能出现的几行。\n"
-    "规则：\n"
-    "1. 只输出要新增的纯代码行。不要注释，不要解释，不要 Markdown 围栏，\n"
-    "   不要任何给人看的说明文字（例如\"这是一个示例\"\"请按实际修改\"）。这些都不要。\n"
-    "2. 不要重复上文已有的内容。\n"
-    "3. 语言必须与上文完全一致（上文是 ST 就写 ST，是 C 就写 C，是 Python 就写 Python）。\n"
-    "4. 风格必须与上文完全一致：缩进宽度、空格、关键字大小写、变量命名。\n"
-    "5. 如果上文是规律性的连续结构（例如按索引递增的连续赋值、重复的样板行），\n"
-    "   就按同样的规律往下推：索引递增，名字和值都照抄上文，每行结构保持一致。\n"
-    "6. 拿不准就输出空字符串，不要编造不存在的函数或变量。"
+    "你在编辑器的光标处续写。只输出要插入的字符，保留必要的换行和缩进。\n"
+    "优先补完当前语句，通常只需 1–3 行。需要补一个代码块时，补齐必要的结束语句后立即停止。\n"
+    "有光标后的代码时，补到能接上下文为止。不要重复前后已有的代码，也不要另起示例或后续逻辑。\n"
+    "沿用光标附近内容的格式。数字或纯文本继续按原格式写。代码沿用原语言、命名、缩进和大小写，遵循索引递增等规律。\n"
+    "不添加解释或 Markdown 围栏。没有把握时输出空文本，不猜测变量、接口或业务逻辑。"
 )
 
 
@@ -183,7 +182,9 @@ def _index_group_1d(context: str):
 
 
 #: 裸编号行：``1`` / ``2`` / ``12``
-_INT_RE = re.compile(r"^\s*(\d+)\s*$")
+_INT_RE = re.compile(r"^\s*(\d{1,18})\s*$")
+_INLINE_NUMBERS_RE = re.compile(r"[0-9]{1,18}(?:[ \t]+[0-9]{1,18}){2,}")
+_NUMBER_COMPLETION_MAX = 6
 
 
 def _number_sequence(context: str):
@@ -200,11 +201,37 @@ def _number_sequence(context: str):
             break
         numbers.append(int(m.group(1)))
     numbers.reverse()
-    if len(numbers) < 2:
-        return None
-    if numbers != list(range(numbers[0], numbers[0] + len(numbers))):
+    if len(numbers) < 2 or not _increases_by_one(numbers):
         return None
     return numbers
+
+
+def _increases_by_one(numbers: list[int]) -> bool:
+    return all(current == previous + 1 for previous, current in zip(numbers, numbers[1:]))
+
+
+def _complete_numbers(prefix: str, suffix: str, max_lines: int) -> str:
+    """续写光标前明确的递增编号，保留数字之间和插入点处的分隔。"""
+    if suffix.strip():
+        return ""
+    current_line = re.split(r"\r\n|\r|\n", prefix)[-1]
+    last_line = _last_line(prefix)
+    numbers = _number_sequence(prefix)
+    if numbers:
+        indent = last_line[:len(last_line) - len(last_line.lstrip())]
+        separator = "\n" + indent
+        leading = separator if current_line.strip() else indent.removeprefix(current_line)
+    elif _INLINE_NUMBERS_RE.fullmatch(last_line.strip()):
+        numbers = [int(value) for value in last_line.split()]
+        if not _increases_by_one(numbers):
+            return ""
+        separator = re.findall(r"[ \t]+", last_line.strip())[-1]
+        leading = separator if current_line and current_line[-1].isdigit() else ""
+    else:
+        return ""
+    count = max(1, min(int(max_lines), _NUMBER_COMPLETION_MAX))
+    start = numbers[-1] + 1
+    return leading + separator.join(str(value) for value in range(start, start + count))
 
 
 def _rhs_numbers(rows):
@@ -357,7 +384,9 @@ def _trim_lines(text: str, limit: int) -> str:
     提示词里写了"最多 N 行"，但 0.5b 这种小模型会失控 —— 实测 4 行上文时它一口气
     写了 24 行（``[4]`` 一路到 ``[27]``）。行数上限不能只靠请求，得在出结果时兜住。
     """
-    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    lines = (text or "").split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
     return "\n".join(lines[:max(1, int(limit))])
 
 
@@ -399,15 +428,11 @@ def ensure_seed_line(context: str, text: str, max_lines: int = 6) -> str:
     return seed + ("\n" + text if (text or "").strip() else "")
 
 
-def build_completion_messages(context: str, max_lines: int = 6) -> List[Dict[str, str]]:
-    """把"光标前几行"拼成一次补全请求（带 few-shot —— 小模型靠模仿才学会规律）。
-
-    为什么塞几组样例：纯指令对 1.3B 级模型基本无效（实测会重复上文、加解说、乱改值），
-    给 2 组"按规律往下推"的样例才学会递增。示例保持纯代码、值照抄，示范正确格式。
-    """
-    body = (context or "").strip("\n")
-    hint = index_pattern_hint(body)
-    seed = index_pattern_seed(body)
+def build_completion_messages(context: str, max_lines: int = 6, *,
+                              suffix: str = "") -> List[Dict[str, str]]:
+    """构造聊天补全请求。有下文时，把插入点两侧的源码分别传给模型。"""
+    hint = index_pattern_hint(context) if not suffix else ""
+    seed = index_pattern_seed(context) if hint else ""
 
     tail = ""
     if hint:
@@ -419,15 +444,16 @@ def build_completion_messages(context: str, max_lines: int = 6) -> List[Dict[str
         tail += (f"\n\n下一组的第一行形如：\n{seed}\n"
                  f"请从这一行开始，按同样的规律写满 {total} 行，不要重复上文。")
 
-    user = (
-        "【光标之前的代码】\n"
-        f"{body}{tail}\n\n"
-        f"请只输出光标处应插入的代码，最多 {max(1, int(max_lines))} 行，不要重复上文。"
-    )
+    user = f"【光标之前的内容】\n<prefix>{context}</prefix>"
+    if suffix:
+        user += f"\n【光标之后的内容】\n<suffix>{suffix}</suffix>"
+    user += (f"{tail}\n\n只输出光标处要插入的最小完整片段，通常最多 {max(1, int(max_lines))} 行。"
+             "补齐必需的收尾后就停止，不要重复上文或下文。")
     messages: List[Dict[str, str]] = [{"role": "system", "content": COMPLETION_SYSTEM}]
-    for example_user, example_assistant in _FEW_SHOT:
-        messages.append({"role": "user", "content": example_user})
-        messages.append({"role": "assistant", "content": example_assistant})
+    if seed and _SEED_LINE_RE.match(seed):
+        for example_user, example_assistant in _FEW_SHOT:
+            messages.append({"role": "user", "content": example_user})
+            messages.append({"role": "assistant", "content": example_assistant})
     messages.append({"role": "user", "content": user})
     return messages
 
@@ -458,14 +484,6 @@ PRESETS: Tuple[Preset, ...] = (
            "codegeex-4", "需要 API Key。"),
     Preset(PROVIDER_OPENAI, "DeepSeek", "https://api.deepseek.com/v1",
            "deepseek-chat", "需要 API Key。"),
-    Preset(PROVIDER_OPENAI, "Ollama 远程（测试机）", "http://159.75.50.193:6500/v1",
-           "qwen2.5-coder:1.5b-base",
-           "已经部署好的一台，端口 6500（不是默认 11434）。无需 key。"
-           "base 模型，支持 FIM。"),
-    Preset(PROVIDER_OPENAI, "Ollama deepseek-base", "http://127.0.0.1:11434/v1",
-           "deepseek-coder:1.3b-base",
-           "ollama pull deepseek-coder:1.3b-base 之后用。"
-           "FIM 用 <fim_begin> 那套 token，程序会自动认。"),
 )
 
 
@@ -495,15 +513,8 @@ FIM_TOKEN = "token"
 DEFAULT_PREFIX_CHARS = 1200
 DEFAULT_SUFFIX_CHARS = 600
 
-#: 自动补全能生成多少行的**安全阀**（不是目标值）。
-#:
-#: 这个数和"预览窗显示几行"（``ai_card_max_lines``）是两回事：
-#: 显示行数只决定卡片里折叠到第几行（超出显示「… 还有 N 行」），
-#: 不该反过来掐模型的输出 —— 掐了就是"明明还能补两行，却只给半截"。
-#:
-#: 这里留 24 行纯粹是防跑飞：模型偶尔会一口气续几百行，插进 PLC 工程里是事故。
-#: 真正决定生成量的是 ``ai_max_tokens``，想多要就调那个。
-MAX_AUTO_LINES = 24
+#: 独立于预览高度。异常超长的补全会提示重试，不把截断的内容交给用户确认。
+MAX_AUTO_LINES = 120
 
 #: 各族 base 模型的 FIM 特殊 token：(前缀, 后缀, 中间)。
 #:
@@ -599,8 +610,8 @@ class AiCompleter(Protocol):
         ...
 
     def complete_lines(self, context: str, max_lines: int = 6,
-                       on_delta: Optional[DeltaCallback] = None) -> str:
-        """「接着往下写」：给光标前几行，返回接下来的几行。
+                       on_delta: Optional[DeltaCallback] = None, *, suffix: str = "") -> str:
+        """给光标前后的代码，返回应插入在光标处的片段。
 
         和 ``complete()`` 分开是因为提示词完全不同 —— 那个是"给我写一段"，
         这个是"猜我接下来会写什么"，后者要强调别重复上文、按同样规律推。
@@ -620,7 +631,7 @@ class NullCompleter:
         return ""
 
     def complete_lines(self, context: str, max_lines: int = 6,
-                       on_delta: Optional[DeltaCallback] = None) -> str:  # noqa: D102
+                       on_delta: Optional[DeltaCallback] = None, *, suffix: str = "") -> str:  # noqa: D102
         return ""
 
     def complete_fim(self, prefix: str, suffix: str = "", max_lines: int = 6,
@@ -729,17 +740,16 @@ class MockCompleter:
         return self._reply(mock_reply(prompt), on_delta)
 
     def complete_lines(self, context: str, max_lines: int = 6,
-                       on_delta: Optional[DeltaCallback] = None) -> str:  # noqa: D102
+                       on_delta: Optional[DeltaCallback] = None, *, suffix: str = "") -> str:  # noqa: D102
         if self._delay and on_delta is None:
             time.sleep(self._delay)
-        return self._reply(mock_reply(context), on_delta)
+        return self._reply(_complete_numbers(context, suffix, max_lines)
+                           or mock_reply(context + "\n" + suffix), on_delta)
 
     def complete_fim(self, prefix: str, suffix: str = "", max_lines: int = 6,
                      on_delta: Optional[DeltaCallback] = None, **_: object) -> str:  # noqa: D102
         """演练 FIM：把前后两段一起当关键词挑片段，至少让链路能跑通。"""
-        if self._delay and on_delta is None:
-            time.sleep(self._delay)
-        return self._reply(mock_reply(prefix + "\n" + suffix), on_delta)
+        return self.complete_lines(prefix, max_lines, on_delta, suffix=suffix)
 
     def describe(self) -> str:                                      # noqa: D102
         return "本地演练"
@@ -811,14 +821,15 @@ DeltaCallback = Callable[[str], None]
 
 
 class _StreamDone(Exception):
-    """流式已经拿到够用的内容，主动收工（**不是错误**）。
+    """FIM 已经到达现有下文，可以结束流式读取。"""
 
-    为什么需要：FIM 没有"写几行就停"的提示词约束，模型会一直往下写，
-    直到自己觉得写完或撞上 ``max_tokens``。而卡片只显示前 N 行 ——
-    于是用户看到正文不动了、状态却还挂着"生成中"，白白干等十几秒
-    （用户报障："都没有继续生成了，为什么还等那么久"）。
-    多出来的那些行反正会被 clean_fim 截掉，不如立刻断开。
-    """
+
+def _finished(reason) -> bool:
+    if reason in ("length", "max_tokens", "max_output_tokens"):
+        raise AiOutputIncomplete("模型达到输出上限。可以缩小补全范围，或提高 AI 的 token 上限。")
+    if reason in ("content_filter", "cancelled", "error"):
+        raise AiOutputIncomplete("服务提前结束了生成，请重试。")
+    return bool(reason)
 
 
 def _post_stream(url: str, payload: dict, api_key: str, timeout: float,
@@ -899,9 +910,9 @@ def _post_stream(url: str, payload: dict, api_key: str, timeout: float,
                     try:
                         on_delta("".join(acc))
                     except _StreamDone:
-                        # 内容够了，主动收工。连接随后被 with 关掉，
-                        # 服务端那边的生成也会停 —— 但已经拿到的照用。
                         break
+            if _finished(first.get("finish_reason")):
+                break
     return "".join(acc)
 
 
@@ -961,7 +972,7 @@ class OpenAiCompleter:
         }
         payload.update(self._thinking_flag())
         try:
-            return self._post(payload, max_tokens, on_delta)
+            return self._post(payload, on_delta)
         except ValueError as exc:
             # 服务端不认 thinking 字段时去掉重试一次 —— 老服务不该因此挂掉
             if not self._disable_thinking or "thinking" not in str(exc).lower():
@@ -969,51 +980,50 @@ class OpenAiCompleter:
             log.info("服务端不认 thinking 字段，去掉重试")
             payload.pop("thinking", None)
             self._disable_thinking = False      # 后续请求不再带
-            return self._post(payload, max_tokens, on_delta)
+            return self._post(payload, on_delta)
 
-    def _post(self, payload: dict, max_tokens: int,
-              on_delta: Optional[DeltaCallback]) -> str:
+    def _post(self, payload: dict, on_delta: Optional[DeltaCallback]) -> str:
         if on_delta is None:
             data = _post_json(self._url, payload, self._key, self._timeout)
-            return clean_code(_first_content(data))
-        raw = _post_stream(self._url, payload, self._key, self._timeout, on_delta)
-        return clean_code(raw)
+            return _first_content(data)
+        return _post_stream(self._url, payload, self._key, self._timeout, on_delta)
 
     def complete(self, prompt: str, context: str = "",
                  on_delta: Optional[DeltaCallback] = None) -> str:  # noqa: D102
-        return self._chat(
+        text = self._chat(
             build_messages(prompt, context, system=self._system),
             self._max_tokens,
             on_delta,
         )
+        return clean_code(text, preserve_indent=True, strict_limit=True)
 
     def complete_lines(self, context: str, max_lines: int = 6,
-                       on_delta: Optional[DeltaCallback] = None) -> str:  # noqa: D102
-        # 纯编号序列（1/2/3/4 → 5/6/7/8）是算得出来的，不必问模型：
-        # 实测 0.5b 在这里会完全跑偏，输出 yOutput[4] := y5;，还慢好几秒。
-        numbers = _number_sequence(context)
-        if numbers:
-            total = max(1, int(max_lines))
-            start = numbers[-1] + 1
-            text = "\n".join(str(start + i) for i in range(total))
+                       on_delta: Optional[DeltaCallback] = None, *, suffix: str = "") -> str:  # noqa: D102
+        prefix = clamp_tail(context, self._prefix_chars)
+        suffix = clamp_head(suffix, self._suffix_chars).replace("\r\n", "\n").replace("\r", "\n")
+        text = _complete_numbers(prefix, suffix, max_lines)
+        if text:
             if on_delta is not None:
                 on_delta(text)
             return text
 
-        # 温度压到 0.1：补全要的是"老老实实按上文规律往下推"（确定性模仿），
-        # 不是"发挥创意"。小模型（1~2B 级）对温度尤其敏感 —— 高一点就爱乱改值、
-        # 加解说、重复上文；压低了才肯照着 few-shot 的样例走。
-        #
-        # token 预算直接给足 self._max_tokens：想让它多写就调 ai_max_tokens，
-        # 而不是靠"少说几行"把它忽悠住。行数只用来告诉模型"大概要几行"。
-        text = self._chat(
-            build_completion_messages(context, max_lines),
+        def clean(raw: str) -> str:
+            text = _drop_prefix_echo(clean_fim(raw, suffix, _MAX_LINES), prefix)
+            return _check_completion_size(text, MAX_AUTO_LINES)
+
+        def push(raw: str) -> None:
+            on_delta(clean(raw))
+
+        raw = self._chat(
+            build_completion_messages(prefix, max_lines, suffix=suffix),
             self._max_tokens,
-            on_delta,
+            push if on_delta is not None else None,
             temperature=0.1,
         )
-        # 模型偶尔从种子的下一行开始写，把算好的那一行补回来（不会重复）
-        return _trim_lines(ensure_seed_line(context, text, max_lines), max_lines)
+        text = clean(raw)
+        if not suffix:
+            text = ensure_seed_line(prefix, text, max_lines)
+        return _check_completion_size(text, MAX_AUTO_LINES)
 
     # ------------------------------------------------------------ FIM
 
@@ -1072,10 +1082,16 @@ class OpenAiCompleter:
         # 两头都朝光标收敛：前面留最近的，后面留最近的。
         raw_prefix, raw_suffix = prefix or "", suffix or ""
         prefix = clamp_tail(raw_prefix, self._prefix_chars)
-        suffix = clamp_head(raw_suffix, self._suffix_chars)
+        suffix = clamp_head(raw_suffix, self._suffix_chars).replace("\r\n", "\n").replace("\r", "\n")
         if len(prefix) < len(raw_prefix) or len(suffix) < len(raw_suffix):
             log.info("FIM 上下文按字符上限裁剪：prefix %d→%d，suffix %d→%d",
                      len(raw_prefix), len(prefix), len(raw_suffix), len(suffix))
+
+        text = _complete_numbers(prefix, suffix, max_lines)
+        if text:
+            if on_delta is not None:
+                on_delta(text)
+            return text
 
         # 流式也要按"最终会插入的样子"推给界面：否则预览窗会先显示一大段
         # （包括和 suffix 重复的尾巴），确认后才突然变短，看起来像出错。
@@ -1088,7 +1104,7 @@ class OpenAiCompleter:
                 # 却不干活，跟不支持没区别，不如换条路再试一次。
                 if mode == FIM_AUTO and not (raw or "").strip():
                     raise FimUnsupported("返回空")
-                return clean_fim(raw, suffix, max_lines)
+                return _checked_fim(raw, suffix, max_lines)
             except FimUnsupported as exc:
                 if mode == FIM_SERVER:
                     raise ValueError(
@@ -1104,7 +1120,7 @@ class OpenAiCompleter:
             raise ValueError(
                 f"这个服务没有可用的 /completions 接口（{exc}），FIM 走不通 —— "
                 "把「FIM 补全」关掉，改用 chat 接口的普通补全。") from exc
-        return clean_fim(raw, suffix, max_lines)
+        return _checked_fim(raw, suffix, max_lines)
 
     def describe(self) -> str:                                      # noqa: D102
         return f"{self._model} @ {self._url}"
@@ -1177,6 +1193,7 @@ def _first_content(data: dict) -> str:
             raise ValueError(f"服务返回错误：{err}")
         return ""
     first = choices[0] if isinstance(choices[0], dict) else {}
+    _finished(first.get("finish_reason"))
     message = first.get("message") or {}
     content = message.get("content")
     if isinstance(content, str):
@@ -1248,7 +1265,7 @@ _CODE_START = re.compile(
 _MAX_LINES = 200
 
 
-def clean_code(text: str) -> str:
+def clean_code(text: str, *, preserve_indent: bool = False, strict_limit: bool = False) -> str:
     """把模型返回的东西洗成"能直接插进编辑器"的代码。
 
     为什么不信任原文：
@@ -1278,9 +1295,8 @@ def clean_code(text: str) -> str:
     lines = [line.rstrip() for line in lines]
 
     # 去掉公共缩进（只按非空行算，否则空行会把缩进算成 0）
-    indents = [len(line) - len(line.lstrip(" ")) for line in lines if line.strip()]
-    if indents:
-        cut = min(indents)
+    if not preserve_indent:
+        cut = min((len(line) - len(line.lstrip(" ")) for line in lines if line.strip()), default=0)
         if cut > 0:
             lines = [line[cut:] if line.strip() else "" for line in lines]
 
@@ -1290,6 +1306,8 @@ def clean_code(text: str) -> str:
         lines.pop()
 
     if len(lines) > _MAX_LINES:
+        if strict_limit:
+            raise AiOutputIncomplete("返回的代码过长，请缩小改写范围后重试。")
         log.warning("模型返回 %d 行，已截断到 %d 行", len(lines), _MAX_LINES)
         lines = lines[:_MAX_LINES]
 
@@ -1297,6 +1315,17 @@ def clean_code(text: str) -> str:
 
 
 # ---------------------------------------------------------------- FIM 清洗
+
+
+def _drop_prefix_echo(text: str, prefix: str) -> str:
+    """只移除连续照抄的多行上文，保留单独重复的结束符或语句。"""
+    lines = text.split("\n")
+    preceding = prefix.splitlines()
+    for count in range(min(len(lines), len(preceding)), 1, -1):
+        if (lines[:count] == preceding[-count:]
+                and sum(bool(line.strip()) for line in lines[:count]) >= 2):
+            return "\n".join(lines[count:])
+    return text
 
 
 def _trim_overlap(gen: str, suffix: str, window: int = 240) -> str:
@@ -1308,11 +1337,24 @@ def _trim_overlap(gen: str, suffix: str, window: int = 240) -> str:
     """
     if not gen or not suffix:
         return gen
+    echoed = _suffix_echo_start(gen, suffix)
+    if echoed >= 0:
+        return gen[:echoed]
     limit = min(len(gen), len(suffix), max(0, int(window)))
     for size in range(limit, 2, -1):
         if gen.endswith(suffix[:size]):
             return gen[:-size]
     return gen
+
+
+def _suffix_echo_start(text: str, suffix: str) -> int:
+    """识别完整照抄的多行下文。要求行边界，避免误判部分标识符。"""
+    if sum(bool(line.strip()) for line in suffix.splitlines()) < 2:
+        return -1
+    before = "" if suffix.startswith("\n") else r"(?<![^\n])"
+    after = "" if suffix.endswith("\n") else r"(?=\n)"
+    match = re.search(before + re.escape(suffix) + after, text)
+    return match.start() if match else -1
 
 
 def clean_fim(text: str, suffix: str = "", max_lines: int = 6) -> str:
@@ -1348,6 +1390,17 @@ def clean_fim(text: str, suffix: str = "", max_lines: int = 6) -> str:
     return "\n".join(lines)
 
 
+def _check_completion_size(text: str, max_lines: int) -> str:
+    if len(text.splitlines()) > max_lines:
+        raise AiOutputIncomplete("补全结果过长。请缩小补全范围后重试。")
+    return text
+
+
+def _checked_fim(text: str, suffix: str, max_lines: int) -> str:
+    # 多看一行才能区分刚好写完和中途超限。
+    return _check_completion_size(clean_fim(text, suffix, max_lines + 1), max_lines)
+
+
 def _fim_live_delta(on_delta: Optional[DeltaCallback], suffix: str,
                     max_lines: int) -> Optional[DeltaCallback]:
     """把流式回调包一层：每次推给界面的都是"按最终形态洗过"的内容。
@@ -1359,10 +1412,9 @@ def _fim_live_delta(on_delta: Optional[DeltaCallback], suffix: str,
         return None
 
     def push(acc: str) -> None:
-        on_delta(clean_fim(acc, suffix, max_lines))
-        # 已经写超上限了 → 后面的行横竖都会被截掉，再等下去用户只能看着
-        # "生成中"发呆（正文一动不动，因为早就截满 N 行了）。
-        if acc.count("\n") > max_lines:
+        normalized = acc.replace("\r\n", "\n").replace("\r", "\n")
+        on_delta(_checked_fim(normalized, suffix, max_lines))
+        if _suffix_echo_start(normalized, suffix) >= 0:
             raise _StreamDone()
 
     return push
@@ -1371,37 +1423,52 @@ def _fim_live_delta(on_delta: Optional[DeltaCallback], suffix: str,
 # ---------------------------------------------------------------- 工厂
 
 
+class AiConfigurationError(ValueError):
+    """实际 AI 服务的配置缺失或无效。"""
+
+
 def create_completer(settings) -> AiCompleter:
-    """按当前配置造一个 completer。配置不完整时**退回 mock** 并记日志 ——
-    宁可生成一个假片段让人看见"链路是通的"，也别让 Tab 按下去毫无反应。
-    """
+    """按设置选择实际服务或明确选中的演练模式。"""
     provider = (getattr(settings, "ai_provider", PROVIDER_MOCK) or PROVIDER_MOCK).lower()
-    if provider == PROVIDER_OPENAI:
-        try:
-            return OpenAiCompleter(
-                base_url=settings.ai_base_url,
-                model=settings.ai_model,
-                api_key=settings.ai_api_key,
-                timeout=settings.ai_timeout,
-                temperature=settings.ai_temperature,
-                max_tokens=settings.ai_max_tokens,
-                disable_thinking=getattr(settings, "ai_disable_thinking", True),
-                prefix_chars=getattr(settings, "ai_prefix_max_chars",
-                                      DEFAULT_PREFIX_CHARS),
-                suffix_chars=getattr(settings, "ai_suffix_max_chars",
-                                      DEFAULT_SUFFIX_CHARS),
-            )
-        except Exception as exc:      # noqa: BLE001
-            log.warning("AI 配置不完整（%s），退回本地演练模式", exc)
-            return MockCompleter()
-    return MockCompleter(delay=0.0)
+    if provider == PROVIDER_MOCK:
+        return MockCompleter(delay=0.0)
+    if provider != PROVIDER_OPENAI:
+        raise AiConfigurationError("请选择可用的 AI 服务。")
+
+    address = (settings.ai_base_url or "").strip()
+    if not address:
+        raise AiConfigurationError("请输入 AI 服务地址。")
+    try:
+        parsed = urllib.parse.urlsplit(address)
+        port = parsed.port
+    except ValueError as exc:
+        raise AiConfigurationError("AI 服务地址或端口无效。") from exc
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname or port == 0
+            or any(ch.isspace() for ch in address)):
+        raise AiConfigurationError("AI 服务地址应以 http:// 或 https:// 开头，并包含主机名。")
+    if not (settings.ai_model or "").strip():
+        raise AiConfigurationError("请输入 AI 模型名。")
+    return OpenAiCompleter(
+        base_url=address,
+        model=settings.ai_model,
+        api_key=settings.ai_api_key,
+        timeout=settings.ai_timeout,
+        temperature=settings.ai_temperature,
+        max_tokens=settings.ai_max_tokens,
+        disable_thinking=getattr(settings, "ai_disable_thinking", True),
+        prefix_chars=getattr(settings, "ai_prefix_max_chars", DEFAULT_PREFIX_CHARS),
+        suffix_chars=getattr(settings, "ai_suffix_max_chars", DEFAULT_SUFFIX_CHARS),
+    )
 
 
 def settings_hint(settings) -> str:
     """一行说明，给自检和界面用。"""
     if not getattr(settings, "ai_enabled", False):
         return "AI 补全：已关闭"
-    completer = create_completer(settings)
+    try:
+        completer = create_completer(settings)
+    except AiConfigurationError as exc:
+        return f"AI 补全：{exc}"
     return f"AI 补全：{'演练模式' if isinstance(completer, MockCompleter) else completer.describe()}"
 
 
@@ -1507,7 +1574,8 @@ def probe(completer: AiCompleter, prompt: str = PROBE_PROMPT) -> ProbeResult:
 
 
 __all__ = [
-    "AiCompleter", "NullCompleter", "MockCompleter", "OpenAiCompleter",
+    "AiCompleter", "AiConfigurationError", "AiOutputIncomplete",
+    "NullCompleter", "MockCompleter", "OpenAiCompleter",
     "Preset", "PRESETS", "PROVIDER_MOCK", "PROVIDER_OPENAI",
     "DEFAULT_SYSTEM", "build_messages", "clean_code", "endpoint_of",
     "COMPLETION_SYSTEM", "build_completion_messages", "index_pattern_hint",
