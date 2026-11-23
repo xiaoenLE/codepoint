@@ -226,6 +226,38 @@ class TestPendingTabOnlyInScope(unittest.TestCase):
         self.assertTrue(p.handle(key(VK_TAB, "\t")))
         self.assertEqual(inj.output(), "x := 1;")
 
+    def test_tab_passes_through_when_editor_changed_inside_same_window(self):
+        p, inj, _, _ = make_pipeline()
+        p._notifier = mock.Mock()
+        p.offer("x := 1;", hwnd=101, is_current=lambda: False)
+        self.assertFalse(p.handle(key(VK_TAB, "\t")))
+        self.assertEqual(inj.calls, [])
+        self.assertFalse(p.has_pending_text)
+
+    def test_tab_after_deadline_passes_through_without_ui_timer(self):
+        p, inj, _, clock = make_pipeline()
+        p._notifier = mock.Mock()
+        p.offer("x := 1;", hwnd=101, timeout=2)
+        clock.advance(2)
+        self.assertFalse(p.handle(key(VK_TAB, "\t")))
+        self.assertEqual(inj.calls, [])
+        self.assertFalse(p.has_pending_text)
+
+    def test_shift_tab_stays_an_editor_shortcut(self):
+        p, inj, _, _ = make_pipeline()
+        p._notifier = mock.Mock()
+        p.offer("x := 1;", hwnd=101)
+        self.assertFalse(p.handle(key(VK_TAB, "\t", shift=True)))
+        self.assertEqual(inj.calls, [])
+        self.assertFalse(p.has_pending_text)
+
+    def test_ai_scope_opt_out_allows_confirmation_in_original_window(self):
+        p, inj, _, _ = make_pipeline(whitelisted=False)
+        p._notifier = mock.Mock()
+        p.offer("x := 1;", hwnd=101, respect_scope=False, is_current=lambda: True)
+        self.assertTrue(p.handle(key(VK_TAB, "\t")))
+        self.assertEqual(inj.output(), "x := 1;")
+
 
 class TestEscapeCancelsGeneration(unittest.TestCase):
     """生成中按 Esc 要能掐断请求。

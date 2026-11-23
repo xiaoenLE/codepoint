@@ -496,7 +496,7 @@ class TestTickerWiring(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.app = App(config_dir=self._tmp.name, headless=True)
+        self.app = App(config_dir=self._tmp.name)
 
     def test_hook_health_is_ticked(self):
         calls: list = []

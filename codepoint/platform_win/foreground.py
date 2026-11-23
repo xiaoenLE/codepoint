@@ -119,7 +119,7 @@ def _process_identity(hwnd: int) -> Tuple[int, str, str]:
 # ------------------------------------------------------------------ 对外接口
 
 
-def query(hwnd: Optional[int] = None, use_cache: bool = True) -> WindowInfo:
+def query(hwnd: Optional[int] = None, use_cache: bool = True, *, include_title: bool = True) -> WindowInfo:
     """取前台（或指定 hwnd）的信息。异常情况一律返回 valid=False 的对象。"""
     if hwnd is None:
         hwnd = foreground_hwnd()
@@ -143,7 +143,7 @@ def query(hwnd: Optional[int] = None, use_cache: bool = True) -> WindowInfo:
         pid=pid,
         process_name=name,
         process_path=path,
-        window_title=window_title(hwnd),
+        window_title=window_title(hwnd) if include_title else "",
         thread_id=window_thread_id(hwnd),
     )
 

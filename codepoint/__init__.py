@@ -13,7 +13,7 @@
                      platform_win ──┘（通过 ports 实现接口）
 """
 
-__version__ = "1.6.13"
+__version__ = "1.6.15"
 __author__ = "xiaoen"
 APP_NAME = "CodePoint"                  # 配置目录 / 互斥体名（ASCII，避免路径编码问题）
 APP_DISPLAY_NAME = "码点助手"            # 界面上显示的名字

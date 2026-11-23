@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+_MODIFIER_KEYS = frozenset({0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5})
+
 # ------------------------------------------------------------------ 修饰键
 
 
@@ -60,6 +62,10 @@ class KeyPress:
     timestamp: float = field(default_factory=time.monotonic)
 
     # —— 语义分类：给快捷输入的缓冲区用 ——
+
+    @property
+    def is_modifier(self) -> bool:
+        return self.vk in _MODIFIER_KEYS
 
     @property
     def is_word_char(self) -> bool:

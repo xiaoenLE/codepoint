@@ -320,7 +320,7 @@ class TestSelectionGrabber(unittest.TestCase):
 
 class TestAiContextDoesNotMoveCaret(unittest.TestCase):
     def _run_worker(self, context, *, copied=GrabResult(), prefix=GrabResult(), suffix=GrabResult(),
-                    process_name=""):
+                    process_name="", type_during_request=False):
         import threading
         from codepoint.app import App
         from codepoint.core.events import WindowInfo
@@ -337,11 +337,18 @@ class TestAiContextDoesNotMoveCaret(unittest.TestCase):
         app._scope_allows = mock.Mock(return_value=True)
         app._injection_block_reason = mock.Mock(return_value="")
         app._notify_safe = mock.Mock()
+        app._notifier = None
         app._stream_updater = mock.Mock(return_value=None)
         app._pipeline = mock.Mock()
+        app._pipeline.input_revision = 0
         backend = mock.Mock()
         backend.complete.return_value = "rewritten;"
         backend.complete_fim.return_value = "inserted;"
+        if type_during_request:
+            def finish_after_typing(*args, **kwargs):
+                app._pipeline.input_revision += 1
+                return "old context;"
+            backend.complete_fim.side_effect = finish_after_typing
         with mock.patch("codepoint.app.editor_context.read", return_value=context), \
                 mock.patch("codepoint.app.foreground.query", return_value=WindowInfo(
                     hwnd=101, pid=100, process_name=process_name)), \
@@ -357,6 +364,14 @@ class TestAiContextDoesNotMoveCaret(unittest.TestCase):
         app._grabber.grab.assert_not_called()
         self.assertEqual(backend.complete_fim.call_args.args[:2], ("x := ", ";"))
         app._pipeline.offer.assert_called_once()
+
+    def test_typing_in_same_editor_during_generation_discards_result(self):
+        from codepoint.platform_win.editor_context import EditorContext
+
+        app, backend = self._run_worker(EditorContext(prefix="x := ", suffix=";"),
+                                        type_during_request=True)
+        backend.complete_fim.assert_called_once()
+        app._pipeline.offer.assert_not_called()
 
     def test_st_editors_use_legacy_capture_when_text_ranges_are_unavailable(self):
         for process_name in ("invtmatic studio.exe", "codesys.exe"):
@@ -405,6 +420,43 @@ class TestAiContextDoesNotMoveCaret(unittest.TestCase):
                                  ("CheckANDConfig := TRUE;\r\n\r\n", "\r\n// 下一段"))
                 app._notify_safe.assert_not_called()
                 app._pipeline.offer.assert_called_once()
+
+
+class TestCompletionRouting(unittest.TestCase):
+    def setUp(self):
+        from codepoint.app import App
+        self.app = App.__new__(App)
+        self.app.settings = Settings(ai_fim_strategy="server")
+        self.backend = mock.Mock()
+
+    def test_blank_suffix_goes_to_chat_even_if_server_fim_is_selected(self):
+        self.backend.complete_lines.return_value = "42;"
+        text = self.app._complete_context(self.backend, "x := ", "\r\n", None, use_fim=True)
+        self.assertEqual(text, "42;")
+        self.backend.complete_lines.assert_called_once_with("x := ", on_delta=None)
+        self.backend.complete_fim.assert_not_called()
+
+    def test_fim_only_endpoint_still_completes_with_a_blank_suffix(self):
+        from urllib.error import HTTPError
+        self.backend.complete_lines.side_effect = HTTPError("http://x", 404, "Not Found", {}, None)
+        self.backend.complete_fim.return_value = "42;"
+        self.assertEqual(self.app._complete_context(self.backend, "x := ", "\r\n", None, use_fim=True),
+                         "42;")
+        self.backend.complete_fim.assert_called_once()
+
+    def test_unsupported_fim_falls_back_and_keeps_suffix(self):
+        from codepoint.services.ai_provider import FimUnsupported
+        self.backend.complete_fim.side_effect = FimUnsupported("HTTP 404")
+        self.backend.complete_lines.return_value = "42"
+        self.assertEqual(self.app._complete_context(self.backend, "x := ", ";", None, use_fim=True), "42")
+        self.backend.complete_lines.assert_called_once_with("x := ", on_delta=None, suffix=";")
+
+    def test_model_truncation_with_suffix_does_not_restart_generation(self):
+        from codepoint.services.ai_provider import AiOutputIncomplete
+        self.backend.complete_fim.side_effect = AiOutputIncomplete("token limit")
+        with self.assertRaises(AiOutputIncomplete):
+            self.app._complete_context(self.backend, "x := ", ";", None, use_fim=True)
+        self.backend.complete_lines.assert_not_called()
 
 
 # ---------------------------------------------------------------- 连接测试

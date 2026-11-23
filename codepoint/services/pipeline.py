@@ -21,11 +21,12 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from ..core.events import (
     UNAVAILABLE_IME,
     KeyPress,
+    WindowInfo,
     VK_ESCAPE,
     VK_TAB,
 )
@@ -86,7 +87,9 @@ class _PendingCompletion:
     text: str
     backspaces: int          # 确认时要先吃掉的字符数（`//ai xxx` 那串）
     hwnd: int
-    label: str = "AI 生成"
+    expires_at: Optional[float] = None
+    is_current: Optional[Callable[[], bool]] = None
+    respect_scope: bool = True
 
 
 class KeyboardPipeline:
@@ -123,6 +126,8 @@ class KeyboardPipeline:
         # 生成在 app 的热键线程里做（那一头要在按键前后操作剪贴板），
         # "弹窗还是直接插"也由 app 根据 ai_card_enabled 决定。
         self._pending_text: Optional[_PendingCompletion] = None
+        self._pending_lock = threading.Lock()
+        self._input_revision = 0
 
     # ------------------------------------------------------------ 配置
 
@@ -173,6 +178,11 @@ class KeyboardPipeline:
     def app_filter(self) -> AppFilter:
         return self._app_filter
 
+    @property
+    def input_revision(self) -> int:
+        """钩子每次收到可能改变编辑位置的物理按键时递增。"""
+        return self._input_revision
+
     # ------------------------------------------------------------ 主流程
 
     def handle(self, key: KeyPress) -> bool:
@@ -185,8 +195,11 @@ class KeyboardPipeline:
 
     def _handle(self, key: KeyPress) -> bool:
         self._stats.keys_seen += 1
+        editing_key = key.is_down and not key.is_modifier
 
         if not self._enabled:
+            if editing_key:
+                self._input_revision += 1
             self._stats.last_reason = "已暂停"
             return False
 
@@ -205,22 +218,19 @@ class KeyboardPipeline:
         if key.is_down and key.vk == VK_ESCAPE and self._cancel_hook is not None:
             self._cancel_hook()
 
-        # ②.5 有挂起的补全结果时：Tab = 接受，其它任何键 = 作废
-        #     （必须先于后面所有逻辑：此时 Tab 不能被当成"触发 AI"，
-        #       也不该落到编辑器里插一个制表符。）
-        #
-        #     ⚠ Tab 只在**受管程序**里才算"接受"。用户切到别的软件后按的 Tab
-        #     跟我们没关系，不能吞 —— 以前不看 ``targeted``，在别的程序里按
-        #     Tab 会被吃掉、看起来像"键盘失灵"。结果本身照旧作废（窗口/光标
-        #     都变了，插进去就是错位）。
-        if self._pending_text is not None and key.is_down:
-            if targeted and key.vk == VK_TAB:
-                self.accept_pending()
+        # 只有成功接受当前补全才吞掉 Tab。其余会改变编辑位置的按键使结果失效。
+        pending = self._pending_text
+        if pending is not None and editing_key:
+            if (key.vk == VK_TAB and not key.modifiers.any and self.accept_pending(window)):
                 self._stats.keys_swallowed += 1
+                self._input_revision += 1
                 return True
-            # Esc、方向键、普通字符 —— 光标位置要变了，这份结果就不能再插，
-            # 否则代码会落在错误的地方。宁可丢掉，也不能插错。
-            self.cancel_pending()
+            self._input_revision += 1
+            self.cancel_pending(expected=pending)
+            if key.vk == VK_TAB:
+                return False
+        elif editing_key:
+            self._input_revision += 1
 
         if not targeted:
             return False
@@ -326,7 +336,8 @@ class KeyboardPipeline:
 
     def offer(self, text: str, *, backspaces: int = 0,
               label: str = "AI 生成", hwnd: Optional[int] = None,
-              timeout: float = 0.0) -> bool:
+              timeout: float = 0.0, is_current: Optional[Callable[[], bool]] = None,
+              respect_scope: bool = True) -> bool:
         """把生成好的文本**挂起**，等用户按 Tab 确认。
 
         这是整个交互的核心：不再"生成完就插"，而是"生成完先给你看"。
@@ -337,32 +348,39 @@ class KeyboardPipeline:
         if not (text or "").strip():
             return False
         target = self._windows.front().hwnd if hwnd is None else hwnd
-        self._pending_text = _PendingCompletion(
-            text=text,
-            backspaces=max(0, int(backspaces)),
-            hwnd=int(target or 0),
-            label=label,
-        )
-        self._stats.ai_started += 1
-        self._notifier.show_card(Card.ready(label, text, timeout=timeout))
-        self._stats.last_reason = f"待确认：{label}"
+        with self._pending_lock:
+            self._pending_text = _PendingCompletion(
+                text=text,
+                backspaces=max(0, int(backspaces)),
+                hwnd=int(target or 0),
+                expires_at=self._now() + timeout if timeout > 0 else None,
+                is_current=is_current,
+                respect_scope=respect_scope,
+            )
+            self._stats.ai_started += 1
+            self._notifier.show_card(Card.ready(label, text, timeout=timeout))
+            self._stats.last_reason = f"待确认：{label}"
         return True
 
     @property
     def has_pending_text(self) -> bool:
         return self._pending_text is not None
 
-    def accept_pending(self) -> bool:
+    def accept_pending(self, window: Optional[WindowInfo] = None) -> bool:
         """用户按 Tab：真正插入。"""
-        pending = self._pending_text
-        if pending is None:
-            return False
-        self._pending_text = None
-        self._notifier.hide()
-
-        if self._windows.front().hwnd != pending.hwnd:
+        with self._pending_lock:
+            pending = self._pending_text
+            if pending is None:
+                return False
+            self._pending_text = None
+            self._notifier.hide()
+        current_window = window if window is not None else self._windows.front()
+        if (not self._enabled or current_window.hwnd != pending.hwnd
+                or (pending.respect_scope and not self._app_filter.matches(current_window))
+                or (pending.expires_at is not None and self._now() >= pending.expires_at)
+                or (pending.is_current is not None and not pending.is_current())):
             self._stats.ai_dropped += 1
-            log.info("确认时前台窗口已变，放弃插入")
+            self._stats.last_reason = "补全上下文已失效"
             return False
 
         if pending.backspaces > 0:
@@ -375,15 +393,21 @@ class KeyboardPipeline:
         self._stats.last_reason = "已接受补全"
         return True
 
-    def cancel_pending(self) -> bool:
+    def cancel_pending(self, *, expected: Optional[_PendingCompletion] = None) -> bool:
         """用户按了别的键 / Esc：这份结果作废。"""
-        if self._pending_text is None:
-            return False
-        self._pending_text = None
-        self._notifier.hide()
-        self._stats.ai_dropped += 1
-        self._stats.last_reason = "补全已取消"
-        return True
+        with self._pending_lock:
+            if self._pending_text is None or (expected is not None and self._pending_text is not expected):
+                return False
+            self._pending_text = None
+            self._notifier.hide()
+            self._stats.ai_dropped += 1
+            self._stats.last_reason = "补全已取消"
+            return True
+
+    def expire_pending(self) -> None:
+        pending = self._pending_text
+        if pending is not None and pending.expires_at is not None and self._now() >= pending.expires_at:
+            self.cancel_pending(expected=pending)
 
     def _auto_hide(self, delay: float) -> None:
         """过一会儿自动收起提示（失败提示不该一直挂在那）。"""
@@ -396,7 +420,8 @@ class KeyboardPipeline:
 
     def close(self) -> None:
         """退出前收摊：作废挂起的结果，别让一块窗孤零零留在屏幕上。"""
-        self._pending_text = None
+        with self._pending_lock:
+            self._pending_text = None
         try:
             self._notifier.hide()
         except Exception:      # noqa: BLE001
@@ -428,7 +453,8 @@ class KeyboardPipeline:
 
     def _close_indicator(self) -> None:
         # 挂起的结果也要一起作废：总开关关掉之后按 Tab 不该再插入任何东西
-        self._pending_text = None
+        with self._pending_lock:
+            self._pending_text = None
         self._quick.reset()
         try:
             self._notifier.hide()
@@ -437,5 +463,6 @@ class KeyboardPipeline:
 
     def tick(self) -> None:
         """周期性调用：处理呼吸灯超时。"""
+        self.expire_pending()
         if self._quick.expire(self._now()):
             self._notifier.hide()

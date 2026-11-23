@@ -71,6 +71,10 @@ class AppFilter:
     def items(self) -> List[AppItem]:
         return list(self._items)
 
+    @property
+    def needs_window_title(self) -> bool:
+        return any(item.enabled and item.window_title for item in self._items)
+
     # ------------------------------------------------------------ 匹配
 
     def first_match(self, window: WindowInfo) -> Optional[AppItem]:

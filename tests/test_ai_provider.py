@@ -796,8 +796,7 @@ class TestPipelineOffer(unittest.TestCase):
         pipe = self._pipeline()
         pipe.offer("X := 1;", hwnd=1001)
         self.windows.window = _window(hwnd=2002)
-        # Tab 还是要吞掉（否则编辑器会插一个制表符），但内容不能插
-        self.assertTrue(self._tab(pipe))
+        self.assertFalse(self._tab(pipe), "窗口切换后，Tab 应交还新窗口")
         self.assertEqual(self.injector.texts, [], "窗口变了就别插")
         self.assertEqual(pipe.stats.ai_dropped, 1)
 

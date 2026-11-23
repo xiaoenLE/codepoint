@@ -574,7 +574,7 @@ def fim_tokens_for(model: str, family: str = FIM_AUTO) -> Tuple[str, str, str]:
     return FIM_TOKEN_FAMILIES[key]
 
 
-class FimUnsupported(Exception):
+class FimUnsupported(ValueError):
     """服务端不认 suffix（或压根没有 /completions）—— 调用方可以退到手拼 token。"""
 
 
@@ -1107,7 +1107,7 @@ class OpenAiCompleter:
                 return _checked_fim(raw, suffix, max_lines)
             except FimUnsupported as exc:
                 if mode == FIM_SERVER:
-                    raise ValueError(
+                    raise FimUnsupported(
                         f"服务端不支持 suffix 参数（{exc}）。"
                         "把「FIM 策略」改成「手拼 token」再试。") from exc
                 log.info("服务端 suffix 不可用（%s），改用手拼 FIM token", exc)
@@ -1117,7 +1117,7 @@ class OpenAiCompleter:
         try:
             raw = self._fim_request(prompt, "", budget, live)
         except FimUnsupported as exc:
-            raise ValueError(
+            raise FimUnsupported(
                 f"这个服务没有可用的 /completions 接口（{exc}），FIM 走不通 —— "
                 "把「FIM 补全」关掉，改用 chat 接口的普通补全。") from exc
         return _checked_fim(raw, suffix, max_lines)

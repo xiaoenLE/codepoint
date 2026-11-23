@@ -16,12 +16,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-import queue
 import sys
 import threading
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.error import HTTPError
 
 from . import APP_NAME, APP_DISPLAY_NAME, __version__
 from .core import portable
@@ -47,14 +48,14 @@ from .platform_win.single_instance import SingleInstance
 from .platform_win.tray import TrayIcon, TrayMenuItem
 from .services.clipboard_filter import ClipboardPunctuationFilter
 from .services.ai_provider import (
-    MAX_AUTO_LINES, AiConfigurationError, AiOutputIncomplete, MockCompleter,
+    MAX_AUTO_LINES, AiConfigurationError, AiOutputIncomplete, FimUnsupported, MockCompleter,
     ProbeResult, create_completer, probe,
 )
 from .services.selection import SelectionGrabber
 from .services.hook_health import HookHealthMonitor
 from .services.pipeline import KeyboardPipeline
 from .services.app_filter import AppFilter
-from .ui.bridge import UiBridge
+from .ui.bridge import NullBridge, UiBridge
 from .ui.indicator import IndicatorNotifier
 from .ui.main_window import MainWindow
 
@@ -105,11 +106,12 @@ _REASON_CN: Dict[str, str] = {
 class _WindowProbeAdapter:
     """services.ports.WindowProbe 的实现。"""
 
-    def __init__(self, self_pid: int) -> None:
+    def __init__(self, self_pid: int, scope: AppFilter) -> None:
         self._self_pid = self_pid
+        self._scope = scope
 
     def front(self) -> WindowInfo:
-        return foreground.query()
+        return foreground.query(include_title=self._scope.needs_window_title)
 
     def self_pid(self) -> int:
         return self._self_pid
@@ -271,7 +273,7 @@ class App:
         self._baseline: str = self._fingerprint()
 
         self.icon_path: Optional[str] = None
-        self.bridge = UiBridge()
+        self.bridge = NullBridge() if headless else UiBridge()
         self._instance = SingleInstance(APP_NAME)
         self._message_window: Optional[MessageWindow] = None
         self._hook: Optional[KeyboardHook] = None
@@ -279,7 +281,7 @@ class App:
         self._hotkeys: Optional[HotkeyManager] = None
         self._clipboard_listener: Optional[ClipboardListener] = None
         self._clipboard_filter = ClipboardPunctuationFilter(self.settings.enable_clipboard_replace)
-        self._clipboard_jobs: "queue.Queue[bool]" = queue.Queue(maxsize=1)
+        self._clipboard_ready = threading.Event()
         self._clipboard_worker: Optional[threading.Thread] = None
         self._ticker: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -337,10 +339,12 @@ class App:
     def run(self) -> int:
         if self.headless:
             try:
-                while not self._stop.is_set():
-                    time.sleep(0.5)
+                while not self._stop.wait(0.5):
+                    pass
             except KeyboardInterrupt:
                 pass
+            finally:
+                self.shutdown()
             return 0
 
         self._window = MainWindow(
@@ -371,6 +375,8 @@ class App:
         if self._stop.is_set():
             return
         self._stop.set()
+        self._clipboard_ready.set()
+        self._ai_cancel.set()
         log.info("退出中…")
         try:
             # 退出阶段把跨线程等待压到 1 秒：消息线程万一卡住（比如钩子回调
@@ -416,8 +422,8 @@ class App:
     def _setup_logging(self) -> None:
         try:
             self.paths.ensure()
-            handler = logging.FileHandler(self.paths.log_dir / "codepoint.log",
-                                          encoding="utf-8")
+            handler = RotatingFileHandler(self.paths.log_dir / "codepoint.log",
+                                          maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8")
             handler.setFormatter(logging.Formatter(
                 "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
             logging.getLogger("codepoint").addHandler(handler)
@@ -463,7 +469,7 @@ class App:
                           self_pid=os.getpid())
         self._app_scope = scope
         self._pipeline = KeyboardPipeline(
-            window_probe=_WindowProbeAdapter(os.getpid()),
+            window_probe=_WindowProbeAdapter(os.getpid(), scope),
             ime_probe=_ImeProbeAdapter(),
             injector=injector,
             notifier=notifier,
@@ -657,14 +663,22 @@ class App:
         if not self.settings.ai_enabled:
             self._notify_safe("AI 补全已关闭", "到「常规设置 → AI 补全」把它打开。")
             return
+        if not self.settings.global_enabled:
+            self._notify_safe("码点助手已暂停", "恢复功能后再触发补全。")
+            return
         if not self._ai_busy.acquire(blocking=False):
             self._notify_safe("正在生成", "上一次还没回来，稍等一下。")
             return
         try:
-            window = foreground.query()
+            self._ai_cancel.clear()
+            pipeline = self._pipeline
+            revision = pipeline.input_revision if pipeline is not None else None
+            if pipeline is not None:
+                pipeline.cancel_pending()
+            hwnd = foreground.foreground_hwnd()
             threading.Thread(
                 target=self._ai_selection_worker,
-                args=(int(window.hwnd or 0),),
+                args=(hwnd, revision),
                 name="codepoint-ai-select",
                 daemon=True,
             ).start()
@@ -681,7 +695,7 @@ class App:
             except Exception:      # noqa: BLE001
                 pass
 
-    def _stream_updater(self, label: str):
+    def _stream_updater(self, label: str, input_is_current):
         """给 AI 生成做一个"边生成边刷预览窗"的回调。
 
         先弹一块"生成中"的卡把窗口立起来（流式更新只能刷已存在的卡），
@@ -701,7 +715,7 @@ class App:
         def on_delta(partial: str) -> None:
             # 用户按了 Esc → 立刻抛出去，把 HTTP 连接断掉。
             # 检查放在最前面（连节流都不过）：Esc 之后不该再画一帧出来。
-            if self._ai_cancel.is_set():
+            if not input_is_current():
                 raise _AiCancelled()
             now = time.monotonic()
             state["count"] += 1
@@ -750,8 +764,10 @@ class App:
         """
         scope = self._app_scope
         window = foreground.query()
-        if int(window.hwnd or 0) != int(hwnd or 0):
+        if not hwnd or window.hwnd != hwnd:
             return "窗口变了"
+        if window.pid == os.getpid():
+            return "焦点在码点助手窗口"
         # 「生效范围」这一道由 ai_scope_limited 控制（默认管）：
         # 用户报障"设置了只在列表内程序，但没列表的程序里照样能调 ai"。
         # 关掉它 = AI 不看生效范围，哪儿都能用 —— 但下面两道闸始终有效。
@@ -769,14 +785,20 @@ class App:
         """``_injection_block_reason`` 的布尔版本（抓上下文途中反复用）。"""
         return not self._injection_block_reason(hwnd)
 
-    def _ai_selection_worker(self, hwnd: int) -> None:
+    def _ai_selection_worker(self, hwnd: int, revision: Optional[int] = None) -> None:
         """优先读取编辑器文本范围，必要时用键盘取上下文。"""
-        # 每次开工先把上次的取消标记清掉，否则上一次按过 Esc 会让这一次
-        # 刚发出请求就被判定为"已取消"。
-        self._ai_cancel.clear()
         try:
             grabber = self._grabber
-            if grabber is None:
+            pipeline = self._pipeline
+            if pipeline is not None and revision is None:
+                revision = pipeline.input_revision
+
+            def input_is_current() -> bool:
+                return (self.settings.global_enabled and self.settings.ai_enabled
+                        and not self._ai_cancel.is_set()
+                        and (pipeline is None or pipeline.input_revision == revision))
+
+            if grabber is None or not input_is_current():
                 return
             # ⚠ 第一道闸：窗口换了 / 程序不在生效范围 / 焦点在菜单上 —— 立刻收手。
             #    这一步必须早于 grab()，因为 grab() 一上来就是一个 Ctrl+C。
@@ -812,7 +834,7 @@ class App:
             )
 
             def target_still_current() -> bool:
-                return (not self._ai_cancel.is_set()
+                return (input_is_current()
                         and focus_state.query() == target_focus and self._scope_allows(hwnd))
 
             if not target_still_current():
@@ -852,10 +874,20 @@ class App:
                         suffix = below.text
                     context = editor_context.EditorContext(prefix=prefix.text, suffix=suffix)
 
+            caret = ime_mod.caret_point(fallback_to_cursor=False)
+
+            def edit_still_current() -> bool:
+                if not target_still_current():
+                    return False
+                if not caret.valid:
+                    return True
+                current_caret = ime_mod.caret_point(fallback_to_cursor=False)
+                return current_caret == caret
+
             if context.selection.strip():
                 label = "本地演练 · 示例" if demo else "AI 改写"
                 log.info("AI 改写：选中 %d 字", len(context.selection))
-                on_delta = self._stream_updater(label)
+                on_delta = self._stream_updater(label, input_is_current)
                 text = completer.complete(context.selection, on_delta=on_delta)
             else:
                 prefix, suffix = context.prefix, context.suffix
@@ -864,26 +896,23 @@ class App:
                     return
                 label = "本地演练 · 示例" if demo else "AI 补全"
                 log.info("AI 补全：上文 %d 字 · 下文 %d 字", len(prefix), len(suffix))
-                on_delta = self._stream_updater(label)
-                if use_fim and (suffix.strip() or self.settings.ai_fim_strategy != "auto"):
-                    text = self._fim_or_fallback(completer, prefix, suffix, on_delta)
-                else:
-                    text = completer.complete_lines(prefix, on_delta=on_delta)
+                on_delta = self._stream_updater(label, input_is_current)
+                text = self._complete_context(completer, prefix, suffix, on_delta, use_fim=use_fim)
+
+            if not edit_still_current():
+                self._hide_card_safe()
+                log.info("AI 补全：编辑位置已变化，已作废")
+                return
 
             if not text.strip():
                 self._hide_card_safe()
                 self._notify_safe("没有生成可插入的代码", "可以补充相关上下文，或在选区里说明想改什么。")
                 return
-            if not target_still_current():
-                self._hide_card_safe()
-                self._notify_safe("已取消", "等待期间前台窗口变了，没有插入。")
-                return
-
-            pipeline = self._pipeline
             if pipeline is not None and self.settings.ai_card_enabled:
                 # 挂起等确认：倒计时到点自己关，也可以随时按 Esc 关掉。
                 if pipeline.offer(text, backspaces=0, label=label, hwnd=hwnd,
-                                  timeout=self.settings.ai_card_timeout):
+                                  timeout=self.settings.ai_card_timeout, is_current=edit_still_current,
+                                  respect_scope=self.settings.ai_scope_limited):
                     log.info("%s：已挂起 %d 字，等 Tab 确认", label, len(text))
                     return
             self._hide_card_safe()
@@ -902,8 +931,7 @@ class App:
         except _AiCancelled:
             # 用户按 Esc 主动掐掉的 —— 不弹"失败"，也别留半截卡片
             self._hide_card_safe()
-            log.info("AI 生成被 Esc 取消")
-            self._notify_safe("已取消", "生成被掐断了，没有插入任何内容。")
+            log.info("AI 生成已取消")
         except Exception as exc:      # noqa: BLE001
             self._hide_card_safe()
             log.exception("AI 生成失败")
@@ -921,34 +949,39 @@ class App:
             self._notify_safe("按键还没松开", f"按完 {self.settings.ai_hotkey} 把键都松开，再试一次。")
         return result.caret_uncertain or result.modifiers_stuck
 
-    def _fim_or_fallback(self, completer, prefix: str, suffix: str, on_delta) -> str:
-        """先走 FIM，不行就退回老 chat 补全。
+    def _complete_context(self, completer, prefix: str, suffix: str, on_delta, *, use_fim: bool) -> str:
+        """有可用的下文优先走 FIM。端点不可用时才换接口。"""
+        if not use_fim:
+            return completer.complete_lines(prefix, on_delta=on_delta)
 
-        为什么要有兜底：FIM 依赖服务端支持 ``/completions``。碰上不支持的服务
-        （只给 chat 端点的云 API 很常见），直接抛异常的表现是"按了热键什么都没
-        发生"，用户完全不知道发生了什么。退回 chat 至少还能补出点东西。
-        """
+        has_suffix = bool(suffix.strip())
+        if not has_suffix:
+            try:
+                return completer.complete_lines(prefix, on_delta=on_delta)
+            except HTTPError as exc:
+                if exc.code not in (400, 404, 405, 422, 501):
+                    raise
+                log.info("普通补全接口不可用（HTTP %d），尝试 FIM", exc.code)
+
         strategy = getattr(self.settings, "ai_fim_strategy", "auto")
         tokens = getattr(self.settings, "ai_fim_tokens", "auto")
         try:
             text = completer.complete_fim(
                 prefix, suffix, MAX_AUTO_LINES,
                 on_delta=on_delta, strategy=strategy, tokens=tokens)
-            if text.strip():
+            if text.strip() or not has_suffix:
                 return text
             log.info("FIM 返回空，退回普通补全")
-        except _AiCancelled:
-            # 用户按 Esc 掐的 —— 绝不能当成"FIM 失败，退回普通补全"，
-            # 否则取消之后会立刻又发一次请求，白等两遍。
-            raise
-        except Exception as exc:      # noqa: BLE001
-            log.warning("FIM 补全失败（%s），退回普通补全", exc)
+        except FimUnsupported:
+            if not has_suffix:
+                raise
+            log.info("FIM 接口不可用，退回普通补全")
         return completer.complete_lines(prefix, on_delta=on_delta, suffix=suffix)
 
     def cancel_pending(self) -> None:
         """预览窗倒计时到点时由界面线程调进来。"""
         if self._pipeline is not None:
-            self._pipeline.cancel_pending()
+            self._pipeline.expire_pending()
 
     def _on_escape(self) -> None:
         """键盘钩子看见 Esc 时调这里：正在生成就掐掉。
@@ -1036,19 +1069,15 @@ class App:
 
     def _on_clipboard_changed(self) -> None:
         """在消息线程上被调用 —— 只丢一个信号，重的活交给 worker。"""
-        if not self.settings.enable_clipboard_replace:
-            return
-        try:
-            self._clipboard_jobs.put_nowait(True)
-        except queue.Full:
-            pass
+        if self.settings.enable_clipboard_replace:
+            self._clipboard_ready.set()
 
     def _clipboard_loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                self._clipboard_jobs.get(timeout=0.5)
-            except queue.Empty:
-                continue
+            self._clipboard_ready.wait()
+            self._clipboard_ready.clear()
+            if self._stop.is_set():
+                return
             try:
                 self._process_clipboard()
             except Exception:      # noqa: BLE001
@@ -1104,6 +1133,8 @@ class App:
 
     def set_global_enabled(self, enabled: bool) -> None:
         self.settings.global_enabled = enabled
+        if not enabled:
+            self._ai_cancel.set()
         if self._pipeline is not None:
             self._pipeline.set_enabled(enabled)
 
